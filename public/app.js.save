@@ -1,3 +1,4 @@
+
 let allBusesData = [];
 const busMarkers = {};
 
@@ -13,21 +14,15 @@ function formatFleetLabel(vehicleId) {
   return String(vehicleId).trim();
 }
 
-function formatTripTitle(routeDisplay, origin, destination) {
+function formatTripTitle(routeDisplay, destination) {
   if (!routeDisplay || routeDisplay === 'NIS') return 'Not In Service';
 
   let cleanDest = String(destination || '').trim();
   cleanDest = cleanDest.replace(/^route\s*\w+\s*:?\s*/i, '').trim();
   cleanDest = cleanDest.replace(/^to\s+/i, '').trim();
 
-  let cleanOrig = String(origin || '').trim();
-
-  if (cleanOrig && cleanDest) {
-    return `Route ${routeDisplay}: ${cleanOrig} to ${cleanDest}`;
-  } else if (cleanDest) {
-    return `Route ${routeDisplay} to ${cleanDest}`;
-  }
-  return `Route ${routeDisplay}`;
+  if (!cleanDest) return `Route ${routeDisplay}`;
+  return `Route ${routeDisplay} to ${cleanDest}`;
 }
 
 function createBusIcon(routeDisplay) {
@@ -56,7 +51,7 @@ async function fetchAndRenderBuses() {
 function renderAllBusesOnMap() {
   allBusesData.forEach((bus) => {
     const fleetLabel = formatFleetLabel(bus.vehicle_id);
-    const tripTitle = formatTripTitle(bus.route_display, bus.origin, bus.destination);
+    const tripTitle = formatTripTitle(bus.route_display, bus.destination);
     const routeDisplay = bus.route_display || 'NIS';
 
     const popupContent = `
@@ -64,6 +59,7 @@ function renderAllBusesOnMap() {
         <h3>Fleet: ${fleetLabel}</h3>
         <p><strong>Trip:</strong> ${tripTitle}</p>
         <p><strong>Departure Time:</strong> ${bus.start_time || 'N/A'}</p>
+        <p><strong>Status:</strong> ${bus.stop_id}</p>
         <p><strong>Tardiness:</strong> ${bus.tardiness}</p>
         <p><strong>Occupancy:</strong> ${bus.occupancy}</p>
         <button class="btn-history" onclick="openShiftHistory('${bus.vehicle_id}')">View Shift History</button>
@@ -101,9 +97,8 @@ function handleSearch() {
     const rawId = String(bus.vehicle_id).toLowerCase();
     const route = String(bus.route_display || '').toLowerCase();
     const dest = String(bus.destination || '').toLowerCase();
-    const orig = String(bus.origin || '').toLowerCase();
 
-    return fleetLabel.includes(query) || rawId.includes(query) || route.includes(query) || dest.includes(query) || orig.includes(query);
+    return fleetLabel.includes(query) || rawId.includes(query) || route.includes(query) || dest.includes(query);
   }).slice(0, 15);
 
   if (matches.length === 0) {
@@ -114,7 +109,7 @@ function handleSearch() {
 
   dropdown.innerHTML = matches.map((bus) => {
     const fleetLabel = formatFleetLabel(bus.vehicle_id);
-    const tripTitle = formatTripTitle(bus.route_display, bus.origin, bus.destination);
+    const tripTitle = formatTripTitle(bus.route_display, bus.destination);
     const badgeText = bus.route_display || 'NIS';
 
     return `
@@ -153,7 +148,7 @@ async function openShiftHistory(vehicleId) {
     const modalBody = document.getElementById('modal-body');
     const modalContainer = document.getElementById('modal-container');
 
-    if (modalTitle) modalTitle.innerText = `${fleetLabel} — 7-Day Shift History`;
+    if (modalTitle) modalTitle.innerText = `Fleet ${fleetLabel} — 7-Day Shift History`;
 
     if (modalBody) {
       if (!history || history.length === 0) {
@@ -162,15 +157,14 @@ async function openShiftHistory(vehicleId) {
         modalBody.innerHTML = `
           <div class="shift-timeline">
             ${history.map((shift) => {
-              const tripTitle = formatTripTitle(shift.route_display, shift.origin, shift.destination);
               return `
                 <div class="shift-card">
                   <div class="shift-card-top">
                     <span class="shift-date-badge">${shift.day}</span>
                     <span class="shift-time">Start: <strong>${shift.start_time}</strong></span>
                   </div>
-                  <div class="shift-title">${tripTitle}</div>
-                  <div class="shift-status-pill"><strong>${shift.tardiness}</strong></div>
+                  <div class="shift-title">${shift.route_display !== 'NIS' ? `Route ${shift.route_display}` : 'NIS'} — ${shift.destination}</div>
+                  <div class="shift-status-pill">Status: <strong>${shift.tardiness}</strong></div>
                 </div>
               `;
             }).join('')}
@@ -183,80 +177,6 @@ async function openShiftHistory(vehicleId) {
   } catch (err) {
     console.error('Error opening shift history:', err);
   }
-}
-
-function getDayOfWeekName(dateStr) {
-  try {
-    const d = new Date(dateStr + 'T00:00:00');
-    return d.toLocaleDateString('en-US', { weekday: 'long' });
-  } catch (e) {
-    return '';
-  }
-}
-
-async function renderRouteHistoryModal(routeDisplay, selectedDate, targetTripId, targetStartTime) {
-  const dayOfWeek = getDayOfWeekName(selectedDate);
-  const dateDisplayEl = document.getElementById('selected-day-name');
-  if (dateDisplayEl) {
-    dateDisplayEl.innerText = dayOfWeek ? `(${dayOfWeek})` : '';
-  }
-
-  const res = await fetch(`/api/history/route/${encodeURIComponent(routeDisplay)}?day=${encodeURIComponent(selectedDate)}`);
-  const shifts = await res.json();
-
-  const modalBody = document.getElementById('modal-body');
-  if (!modalBody) return;
-
-  if (!shifts || shifts.length === 0) {
-    modalBody.innerHTML = `<p style="color: #666; text-align: center; padding: 20px;">No recorded history for Route ${routeDisplay} on ${selectedDate} ${dayOfWeek ? '(' + dayOfWeek + ')' : ''}.</p>`;
-    return;
-  }
-
-  const vehicleMap = {};
-  shifts.forEach(shift => {
-    if (!vehicleMap[shift.vehicle_id]) vehicleMap[shift.vehicle_id] = [];
-    vehicleMap[shift.vehicle_id].push(shift);
-  });
-
-  let html = `<div class="route-history-container"><p class="date-subtitle"><strong>${dayOfWeek}</strong>, ${selectedDate}</p>`;
-
-  for (const [vehicleId] of Object.entries(vehicleMap)) {
-    const dayRes = await fetch(`/api/history/vehicle-day/${encodeURIComponent(vehicleId)}?day=${encodeURIComponent(selectedDate)}`);
-    const allVehicleTrips = await dayRes.json();
-
-    html += `
-      <div class="vehicle-history-card">
-        <div class="vehicle-card-header">
-          <span>Fleet #: <strong>${vehicleId}</strong></span>
-          <button class="btn-sm" onclick="openShiftHistory('${vehicleId}')">View Full Fleet Shifts</button>
-        </div>
-        <div class="trip-timeline-list">
-    `;
-
-    allVehicleTrips.forEach(trip => {
-      const isTargetTrip = (targetTripId && trip.trip_id === targetTripId) || 
-                           (!targetTripId && trip.route_display === routeDisplay && trip.start_time === targetStartTime);
-      
-      const tripTitle = formatTripTitle(trip.route_display, trip.origin, trip.destination);
-      
-      html += `
-        <div class="trip-row-card ${isTargetTrip ? 'highlighted-target-trip' : ''}">
-          ${isTargetTrip ? '<span class="target-badge">Selected Trip</span>' : ''}
-          <div class="trip-row-top">
-            <span class="trip-route-badge">Route ${trip.route_display}</span>
-            <span class="trip-time">Start: <strong>${trip.start_time}</strong></span>
-          </div>
-          <div class="trip-title">${tripTitle}</div>
-          <div class="trip-status"><strong>${trip.tardiness}</strong></div>
-        </div>
-      `;
-    });
-
-    html += `</div></div>`;
-  }
-
-  html += `</div>`;
-  modalBody.innerHTML = html;
 }
 
 function closeModal() {

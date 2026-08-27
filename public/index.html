@@ -15,7 +15,7 @@
       position: absolute;
       top: 15px;
       left: 60px;
-      z-index: 1000;
+      z-index: 2000;
       width: 320px;
     }
     .search-input-box {
@@ -41,7 +41,7 @@
       box-shadow: 0 4px 14px rgba(0,0,0,0.25);
       max-height: 320px;
       overflow-y: auto;
-      z-index: 1001;
+      z-index: 2001;
     }
     .search-result-item {
       padding: 10px 12px;
@@ -63,6 +63,21 @@
       font-size: 11px;
       font-weight: bold;
     }
+
+    /* Blue Clickable Route Header Button */
+    .search-route-header {
+      padding: 10px 12px;
+      background: #00467F;
+      color: white;
+      cursor: pointer;
+      font-weight: bold;
+      font-size: 13px;
+      border-radius: 6px;
+      margin: 6px;
+      text-align: center;
+      transition: background 0.2s;
+    }
+    .search-route-header:hover { background: #00335f; }
 
     /* Circular Map Markers */
     .bus-marker-badge {
@@ -102,7 +117,7 @@
     }
     .btn-history:hover { background: #004085; }
 
-    /* Redesigned Shift History Modal */
+    /* Modals */
     .modal {
       display: none;
       position: fixed;
@@ -120,7 +135,7 @@
       padding: 24px;
       border-radius: 12px;
       width: 90%;
-      max-width: 540px;
+      max-width: 580px;
       max-height: 80vh;
       overflow-y: auto;
       position: relative;
@@ -147,6 +162,92 @@
       border-bottom: 2px solid #e1e4e8;
     }
 
+    /* Route History Modal Specific Styles */
+    .route-date-selector {
+      margin-bottom: 16px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 14px;
+      font-weight: 600;
+      color: #333;
+    }
+    .route-date-selector select {
+      padding: 6px 10px;
+      border-radius: 6px;
+      border: 1px solid #ccc;
+      font-size: 13px;
+      background: #fff;
+      outline: none;
+    }
+    .route-departures-container {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      max-height: 50vh;
+      overflow-y: auto;
+    }
+    .departure-row {
+      background: #ffffff;
+      border: 1px solid #e1e4e8;
+      border-radius: 8px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+      position: relative;
+    }
+
+    /* Highlighted Target Trip & Badge */
+    .departure-row.highlighted-target-trip {
+      background-color: #eef6ff !important;
+      border: 2px solid #0066cc !important;
+    }
+    .target-badge {
+      position: absolute;
+      top: 10px;
+      right: 12px;
+      background-color: #0066cc;
+      color: white;
+      font-size: 11px;
+      font-weight: bold;
+      padding: 2px 8px;
+      border-radius: 12px;
+    }
+
+    .departure-main-info {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 14px;
+      color: #222;
+    }
+    .btn-shift-check {
+      background: #00B140;
+      color: white;
+      border: none;
+      padding: 5px 10px;
+      border-radius: 5px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+      align-self: flex-start;
+      transition: background 0.2s;
+    }
+    .btn-shift-check:hover { background: #009635; }
+    .shift-details-box {
+      display: none;
+      background: #f4f6f8;
+      padding: 10px;
+      border-radius: 6px;
+      font-size: 13px;
+      color: #444;
+      border-left: 3px solid #0056b3;
+      margin-top: 4px;
+    }
+
+    /* Timeline styling for shift history modal */
     .shift-timeline {
       display: flex;
       flex-direction: column;
@@ -195,13 +296,16 @@
 </head>
 <body>
 
+  <!-- Search Overlay -->
   <div class="search-wrapper">
-    <input type="text" id="bus-search" class="search-input-box" placeholder="Search Route, Fleet RT#, or Dest..." oninput="handleSearch()" autocomplete="off" />
+    <input type="text" id="bus-search" class="search-input-box" placeholder="Search Route, Fleet#, or Dest..." autocomplete="off" />
     <div id="search-results" class="search-results-dropdown"></div>
   </div>
 
+  <!-- Map Container -->
   <div id="map"></div>
 
+  <!-- Universal Shift History Modal -->
   <div id="modal-container" class="modal">
     <div class="modal-content">
       <button class="close-btn" onclick="closeModal()">&times;</button>
@@ -210,7 +314,23 @@
     </div>
   </div>
 
+  <!-- Route History Modal -->
+  <div id="route-history-modal" class="modal">
+    <div class="modal-content">
+      <button class="close-btn" onclick="closeRouteHistory()">&times;</button>
+      <div id="modal-route-title" class="modal-header-title">Route History</div>
+      
+      <div class="route-date-selector">
+        <label for="route-date-select">Select Date:</label>
+        <select id="route-date-select" onchange="loadRouteHistoryForSelectedDate()"></select>
+        <span id="selected-day-name" style="font-weight: bold; color: #555;"></span>
+      </div>
+
+      <div id="route-departures-list" class="route-departures-container"></div>
+    </div>
+  </div>
+
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script src="app.js"></script>
+  <script src="kkbait.js"></script>
 </body>
 </html>
