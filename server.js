@@ -12,6 +12,7 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 const AT_API_KEY = process.env.AT_API_KEY;
+console.log('DEBUG: AT_API_KEY is currently:', process.env.AT_API_KEY ? `Loaded (${process.env.AT_API_KEY.length} chars)` : 'UNDEFINED/BLANK');
 
 const dbPath = path.join(__dirname, 'bus_history.db');
 const db = new sqlite3.Database(dbPath);
