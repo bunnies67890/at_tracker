@@ -8,26 +8,47 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   attribution: '© OpenStreetMap contributors'
 }).addTo(map);
 
+// Prevent Leaflet from intercepting clicks/scrolls on UI overlays
+const searchWrapper = document.querySelector('.search-wrapper');
+if (searchWrapper) {
+  L.DomEvent.disableClickPropagation(searchWrapper);
+  L.DomEvent.disableScrollPropagation(searchWrapper);
+}
+
+const searchDropdown = document.getElementById('search-results');
+if (searchDropdown) {
+  L.DomEvent.disableClickPropagation(searchDropdown);
+  L.DomEvent.disableScrollPropagation(searchDropdown);
+}
+
 function formatFleetLabel(vehicleId) {
   if (!vehicleId) return 'Unknown';
   return String(vehicleId).trim();
 }
 
+function formatCleanDestination(destination) {
+  let cleanDest = String(destination || '').trim();
+  cleanDest = cleanDest.replace(/^route\s*\w+\s*:?\s*/i, '').trim();
+
+  // If there are multiple parts separated by "to", drop the first part (origin)
+  const parts = cleanDest.split(/\s+to\s+/i);
+  if (parts.length > 1) {
+    cleanDest = parts.slice(1).join(' to ');
+  } else {
+    // If it's a one-line destination, strip any leading "to" from GIS feeds
+    cleanDest = cleanDest.replace(/^to\s+/i, '').trim();
+  }
+  return cleanDest;
+}
+
 function formatTripTitle(routeDisplay, origin, destination) {
   if (!routeDisplay || routeDisplay === 'NIS') return 'Not In Service';
 
-  let cleanDest = String(destination || '').trim();
-  cleanDest = cleanDest.replace(/^route\s*\w+\s*:?\s*/i, '').trim();
-  cleanDest = cleanDest.replace(/^to\s+/i, '').trim();
-
-  let cleanOrig = String(origin || '').trim();
-
-  if (cleanOrig && cleanDest) {
-    return `Route ${routeDisplay}: ${cleanOrig} to ${cleanDest}`;
-  } else if (cleanDest) {
-    return `Route ${routeDisplay} to ${cleanDest}`;
+  const cleanDest = formatCleanDestination(destination);
+  if (cleanDest) {
+    return `${routeDisplay} to ${cleanDest}`;
   }
-  return `Route ${routeDisplay}`;
+  return `${routeDisplay}`;
 }
 
 function createBusIcon(routeDisplay) {
@@ -61,10 +82,10 @@ function renderAllBusesOnMap() {
 
     const popupContent = `
       <div class="popup-container">
-        <h3>Fleet: ${fleetLabel}</h3>
+        <h3>${fleetLabel}</h3>
         <p><strong>Trip:</strong> ${tripTitle}</p>
         <p><strong>Departure Time:</strong> ${bus.start_time || 'N/A'}</p>
-        <p><strong>Tardiness:</strong> ${bus.tardiness}</p>
+        <p><strong>Status:</strong> ${bus.tardiness}</p>
         <p><strong>Occupancy:</strong> ${bus.occupancy}</p>
         <button class="btn-history" onclick="openShiftHistory('${bus.vehicle_id}')">View Shift History</button>
       </div>
@@ -86,6 +107,12 @@ function renderAllBusesOnMap() {
   });
 }
 
+// Search Handler without Route prefix
+const searchInputBox = document.getElementById('bus-search');
+if (searchInputBox) {
+  searchInputBox.addEventListener('input', handleSearch);
+}
+
 function handleSearch() {
   const query = (document.getElementById('bus-search')?.value || '').toLowerCase().trim();
   const dropdown = document.getElementById('search-results');
@@ -94,6 +121,13 @@ function handleSearch() {
     dropdown.style.display = 'none';
     dropdown.innerHTML = '';
     return;
+  }
+
+  let html = '';
+
+  if (query.length > 0) {
+    const routeQuery = query.toUpperCase();
+    html += `<div class="search-route-header" onclick="openRouteHistoryModal('${routeQuery}')">View Full Route History for ${routeQuery}</div>`;
   }
 
   const matches = allBusesData.filter((bus) => {
@@ -106,18 +140,12 @@ function handleSearch() {
     return fleetLabel.includes(query) || rawId.includes(query) || route.includes(query) || dest.includes(query) || orig.includes(query);
   }).slice(0, 15);
 
-  if (matches.length === 0) {
-    dropdown.innerHTML = '<div class="search-result-item" style="color: #777;">No matching buses found</div>';
-    dropdown.style.display = 'block';
-    return;
-  }
-
-  dropdown.innerHTML = matches.map((bus) => {
+  matches.forEach((bus) => {
     const fleetLabel = formatFleetLabel(bus.vehicle_id);
     const tripTitle = formatTripTitle(bus.route_display, bus.origin, bus.destination);
     const badgeText = bus.route_display || 'NIS';
 
-    return `
+    html += `
       <div class="search-result-item" onclick="selectBusFromSearch('${bus.vehicle_id}')">
         <div>
           <div class="result-fleet">${fleetLabel}</div>
@@ -126,8 +154,9 @@ function handleSearch() {
         <div class="result-badge">${badgeText}</div>
       </div>
     `;
-  }).join('');
+  });
 
+  dropdown.innerHTML = html;
   dropdown.style.display = 'block';
 }
 
@@ -167,7 +196,7 @@ async function openShiftHistory(vehicleId) {
                 <div class="shift-card">
                   <div class="shift-card-top">
                     <span class="shift-date-badge">${shift.day}</span>
-                    <span class="shift-time">Start: <strong>${shift.start_time}</strong></span>
+                    <span class="shift-time">Departure: <strong>${shift.start_time}</strong></span>
                   </div>
                   <div class="shift-title">${tripTitle}</div>
                   <div class="shift-status-pill"><strong>${shift.tardiness}</strong></div>
@@ -185,6 +214,42 @@ async function openShiftHistory(vehicleId) {
   }
 }
 
+let activeRouteDisplay = '';
+let targetTripContext = null;
+
+async function openRouteHistoryModal(routeDisplay, specificTrip = null) {
+  activeRouteDisplay = routeDisplay;
+  targetTripContext = specificTrip;
+  
+  const dropdown = document.getElementById('search-results');
+  if (dropdown) dropdown.style.display = 'none';
+
+  const modalTitle = document.getElementById('modal-route-title');
+  if (modalTitle) modalTitle.innerText = `${routeDisplay} History`;
+
+  const dateSelect = document.getElementById('route-date-select');
+  try {
+    const res = await fetch(`/api/history/route-days/${encodeURIComponent(routeDisplay)}`);
+    const days = await res.json();
+
+    if (dateSelect) {
+      if (!days || days.length === 0) {
+        const today = new Date().toISOString().split('T')[0];
+        dateSelect.innerHTML = `<option value="${today}">${today}</option>`;
+      } else {
+        dateSelect.innerHTML = days.map(d => `<option value="${d}">${d}</option>`).join('');
+      }
+    }
+
+    const routeModal = document.getElementById('route-history-modal');
+    if (routeModal) routeModal.style.display = 'block';
+
+    loadRouteHistoryForSelectedDate();
+  } catch (e) {
+    console.error('Error opening route history modal:', e);
+  }
+}
+
 function getDayOfWeekName(dateStr) {
   try {
     const d = new Date(dateStr + 'T00:00:00');
@@ -194,69 +259,91 @@ function getDayOfWeekName(dateStr) {
   }
 }
 
-async function renderRouteHistoryModal(routeDisplay, selectedDate, targetTripId, targetStartTime) {
+async function loadRouteHistoryForSelectedDate() {
+  const dateSelect = document.getElementById('route-date-select');
+  const selectedDate = dateSelect ? dateSelect.value : new Date().toISOString().split('T')[0];
+  
   const dayOfWeek = getDayOfWeekName(selectedDate);
-  const dateDisplayEl = document.getElementById('selected-day-name');
-  if (dateDisplayEl) {
-    dateDisplayEl.innerText = dayOfWeek ? `(${dayOfWeek})` : '';
+  const dayNameEl = document.getElementById('selected-day-name');
+  if (dayNameEl) dayNameEl.innerText = dayOfWeek ? `(${dayOfWeek})` : '';
+
+  const departuresList = document.getElementById('route-departures-list');
+  if (!departuresList) return;
+
+  try {
+    const res = await fetch(`/api/history/route/${encodeURIComponent(activeRouteDisplay)}?day=${encodeURIComponent(selectedDate)}`);
+    const shifts = await res.json();
+
+    if (!shifts || shifts.length === 0) {
+      departuresList.innerHTML = `<p style="color: #666; text-align: center; padding: 20px;">No recorded history for ${activeRouteDisplay} on ${selectedDate}.</p>`;
+      return;
+    }
+
+    departuresList.innerHTML = shifts.map((shift) => {
+      const tripTitle = formatTripTitle(shift.route_display, shift.origin, shift.destination);
+      
+      const isTarget = targetTripContext && 
+                       String(shift.vehicle_id) === String(targetTripContext.vehicle_id) && 
+                       String(shift.start_time) === String(targetTripContext.start_time);
+
+      return `
+        <div class="departure-row ${isTarget ? 'highlighted-target-trip' : ''}">
+          ${isTarget ? '<span class="target-badge">Selected Route Trip</span>' : ''}
+          <div class="departure-main-info">
+            <span>Departure: <strong>${shift.start_time}</strong> | <strong>${formatFleetLabel(shift.vehicle_id)}</strong></span>
+            <span><strong>${shift.tardiness}</strong></span>
+          </div>
+          <div style="font-size: 13px; font-weight: 600; color: #222;">${tripTitle}</div>
+          <button class="btn-shift-check" onclick="toggleShiftCheck(this, '${shift.vehicle_id}', '${shift.start_time}', '${shift.route_display}')">Check Shift</button>
+          <div class="shift-details-box"></div>
+        </div>
+      `;
+    }).join('');
+  } catch (err) {
+    console.error('Error loading route history:', err);
   }
+}
 
-  const res = await fetch(`/api/history/route/${encodeURIComponent(routeDisplay)}?day=${encodeURIComponent(selectedDate)}`);
-  const shifts = await res.json();
+async function toggleShiftCheck(btnEl, vehicleId, targetStartTime, targetRouteDisplay) {
+  const row = btnEl.closest('.departure-row');
+  const detailsBox = row.querySelector('.shift-details-box');
 
-  const modalBody = document.getElementById('modal-body');
-  if (!modalBody) return;
-
-  if (!shifts || shifts.length === 0) {
-    modalBody.innerHTML = `<p style="color: #666; text-align: center; padding: 20px;">No recorded history for Route ${routeDisplay} on ${selectedDate} ${dayOfWeek ? '(' + dayOfWeek + ')' : ''}.</p>`;
+  if (detailsBox.style.display === 'block') {
+    detailsBox.style.display = 'none';
     return;
   }
 
-  const vehicleMap = {};
-  shifts.forEach(shift => {
-    if (!vehicleMap[shift.vehicle_id]) vehicleMap[shift.vehicle_id] = [];
-    vehicleMap[shift.vehicle_id].push(shift);
-  });
+  try {
+    const res = await fetch(`/api/history/bus/${encodeURIComponent(vehicleId)}`);
+    const history = await res.json();
 
-  let html = `<div class="route-history-container"><p class="date-subtitle"><strong>${dayOfWeek}</strong>, ${selectedDate}</p>`;
+    if (!history || history.length === 0) {
+      detailsBox.innerHTML = 'No recent shift details found for this vehicle.';
+    } else {
+      detailsBox.innerHTML = `
+        <div style="font-weight: 700; margin-bottom: 6px; color: #111;">This Shift:</div>
+        <ul style="margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 5px;">
+          ${history.slice(0, 5).map(h => {
+            const isThisRun = (String(h.start_time) === String(targetStartTime) && String(h.route_display) === String(targetRouteDisplay));
+            
+            let destText = formatCleanDestination(h.destination);
+            let destDisplay = destText ? ` to <strong>${destText}</strong>` : '';
 
-  for (const [vehicleId] of Object.entries(vehicleMap)) {
-    const dayRes = await fetch(`/api/history/vehicle-day/${encodeURIComponent(vehicleId)}?day=${encodeURIComponent(selectedDate)}`);
-    const allVehicleTrips = await dayRes.json();
-
-    html += `
-      <div class="vehicle-history-card">
-        <div class="vehicle-card-header">
-          <span>Fleet #: <strong>${vehicleId}</strong></span>
-          <button class="btn-sm" onclick="openShiftHistory('${vehicleId}')">View Full Fleet Shifts</button>
-        </div>
-        <div class="trip-timeline-list">
-    `;
-
-    allVehicleTrips.forEach(trip => {
-      const isTargetTrip = (targetTripId && trip.trip_id === targetTripId) || 
-                           (!targetTripId && trip.route_display === routeDisplay && trip.start_time === targetStartTime);
-      
-      const tripTitle = formatTripTitle(trip.route_display, trip.origin, trip.destination);
-      
-      html += `
-        <div class="trip-row-card ${isTargetTrip ? 'highlighted-target-trip' : ''}">
-          ${isTargetTrip ? '<span class="target-badge">Selected Trip</span>' : ''}
-          <div class="trip-row-top">
-            <span class="trip-route-badge">Route ${trip.route_display}</span>
-            <span class="trip-time">Start: <strong>${trip.start_time}</strong></span>
-          </div>
-          <div class="trip-title">${tripTitle}</div>
-          <div class="trip-status"><strong>${trip.tardiness}</strong></div>
-        </div>
+            return `
+              <li style="${isThisRun ? 'color: #d9381e;' : ''}">
+                @ ${h.start_time} - ${h.route_display}${destDisplay} (${h.tardiness})
+                ${isThisRun ? '<span style="color: #d9381e; font-weight: 700; margin-left: 6px;">(this run)</span>' : ''}
+              </li>
+            `;
+          }).join('')}
+        </ul>
       `;
-    });
-
-    html += `</div></div>`;
+    }
+    detailsBox.style.display = 'block';
+  } catch (e) {
+    detailsBox.innerHTML = 'Could not load shift details.';
+    detailsBox.style.display = 'block';
   }
-
-  html += `</div>`;
-  modalBody.innerHTML = html;
 }
 
 function closeModal() {
@@ -264,11 +351,18 @@ function closeModal() {
   if (modalContainer) modalContainer.style.display = 'none';
 }
 
+function closeRouteHistory() {
+  const routeModal = document.getElementById('route-history-modal');
+  if (routeModal) routeModal.style.display = 'none';
+}
+
 window.addEventListener('click', (event) => {
   const modalContainer = document.getElementById('modal-container');
+  const routeModal = document.getElementById('route-history-modal');
   const searchWrapper = document.querySelector('.search-wrapper');
 
   if (event.target === modalContainer) closeModal();
+  if (event.target === routeModal) closeRouteHistory();
   if (searchWrapper && !searchWrapper.contains(event.target)) {
     const dropdown = document.getElementById('search-results');
     if (dropdown) dropdown.style.display = 'none';
