@@ -18,9 +18,15 @@ const dbPath = process.env.RAILWAY_VOLUME_MOUNT_PATH
   ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'bus_history.db') 
   : path.join(__dirname, 'bus_history.db');
 
-const db = new sqlite3.Database(dbPath);
+const db = new sqlite3.Database(dbPath, (err) => {
+  if (err) console.error('Database connection error:', err.message);
+});
 
+// Optimized with WAL mode and NORMAL sync for Railway network volumes
 db.serialize(() => {
+  db.run("PRAGMA journal_mode = WAL;");
+  db.run("PRAGMA synchronous = NORMAL;");
+
   db.run(`
     CREATE TABLE IF NOT EXISTS shift_history (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
