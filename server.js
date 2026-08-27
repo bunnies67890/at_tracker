@@ -64,6 +64,7 @@ let tripStartTimeMap = {};
 let tripServiceMap = {};
 let calendarServices = {}; 
 let calendarExceptions = {}; 
+let routeDisplayToTripsMap = {};
 
 let allStops = [];
 let stopNamesMap = {};
@@ -106,6 +107,27 @@ function timeStrToSeconds(timeStr) {
   return parseInt(parts[0], 10) * 3600 + parseInt(parts[1], 10) * 60 + parseInt(parts[2] || 0, 10);
 }
 
+function timeStrToMinutes(timeStr) {
+  if (!timeStr) return 0;
+  let s = String(timeStr).trim();
+  if (s.includes('T') || (s.includes(' ') && s.includes('-'))) {
+    const parts = s.split(/[\sT]/);
+    s = parts[parts.length - 1];
+  }
+  const match = s.match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?$/i);
+  if (!match) return 0;
+  let hours = parseInt(match[1], 10);
+  const minutes = parseInt(match[2], 10);
+  const ampm = match[3] ? match[3].toUpperCase() : null;
+  if (ampm) {
+    if (ampm === 'PM' && hours < 12) hours += 12;
+    if (ampm === 'AM' && hours === 12) hours = 0;
+  } else {
+    if (hours >= 7 && hours <= 11) hours += 12;
+  }
+  return hours * 60 + minutes;
+}
+
 function isServiceActiveOnDate(serviceId, dateStr) {
   const cleanDate = dateStr.replace(/-/g, '');
   const d = new Date(dateStr + 'T00:00:00');
@@ -118,9 +140,14 @@ function isServiceActiveOnDate(serviceId, dateStr) {
   }
 
   const cal = calendarServices[serviceId];
-  if (!cal) return false;
+  if (!cal) return true; // Fallback: if service not in calendar, assume active
 
-  if (cleanDate < cal.start_date || cleanDate > cal.end_date) return false;
+  // If GTFS static calendar range is outdated, honor the day-of-week anyway
+  const inRange = (cleanDate >= cal.start_date && cleanDate <= cal.end_date);
+  if (!inRange) {
+    return cal[dayKey] === '1';
+  }
+
   return cal[dayKey] === '1';
 }
 
@@ -152,6 +179,7 @@ async function loadOrFetchGtfsData() {
       const zip = new AdmZip(zipPath);
       allStops = [];
       stopNamesMap = {};
+      routeDisplayToTripsMap = {};
 
       const stopsEntry = zip.getEntry('stops.txt');
       if (stopsEntry) {
@@ -317,6 +345,30 @@ async function loadOrFetchGtfsData() {
           tripDestinationMap[extractBaseTripId(tId)] = destName;
         }
       }
+
+      // Populate routeDisplayToTripsMap with normalized uppercase keys
+      for (const tId in tripMetaMap) {
+        const meta = tripMetaMap[tId];
+        const rDisp = meta.route;
+        if (!rDisp || rDisp === 'NIS') continue;
+        const upperRDisp = String(rDisp).trim().toUpperCase();
+        
+        if (!routeDisplayToTripsMap[upperRDisp]) routeDisplayToTripsMap[upperRDisp] = [];
+
+        const startTime = tripStartTimeMap[tId] || 'Scheduled';
+        const orig = tripOriginMap[tId] || '';
+        const dest = meta.destination || tripDestinationMap[tId] || `Route ${rDisp}`;
+        const serviceId = meta.service_id;
+
+        routeDisplayToTripsMap[upperRDisp].push({
+          trip_id: tId,
+          route_display: upperRDisp,
+          service_id: serviceId,
+          origin: orig,
+          destination: dest,
+          start_time: startTime
+        });
+      }
     } catch (e) {
       console.error('[GTFS Static] Error:', e.message);
     }
@@ -439,7 +491,6 @@ app.get('/api/buses/live', async (req, res) => {
       };
     }).filter(Boolean);
 
-    // Optimized bulk database transaction to prevent network volume lag
     db.serialize(() => {
       db.run("BEGIN TRANSACTION;");
       const stmt = db.prepare(`
@@ -605,17 +656,68 @@ app.get('/api/history/vehicle-day/:vehicleId', (req, res) => {
 });
 
 app.get('/api/history/route/:routeDisplay', (req, res) => {
-  const routeDisplay = req.params.routeDisplay;
+  const rawRoute = req.params.routeDisplay || '';
+  const routeDisplay = rawRoute.trim().toUpperCase();
+  const altRouteDisplay = routeDisplay.replace(/^0+/, '');
   const day = req.query.day || new Date().toISOString().split('T')[0];
+
   db.all(
     `SELECT vehicle_id, trip_id, route_display, origin, destination, day, start_time, tardiness, created_at 
      FROM shift_history 
-     WHERE route_display = ? AND day = ? 
-     ORDER BY start_time DESC`,
-    [routeDisplay, day],
+     WHERE (route_display = ? OR route_display = ?) AND day = ?`,
+    [routeDisplay, altRouteDisplay, day],
     (err, rows) => {
-      if (err) return res.status(500).json([]);
-      res.json(rows || []);
+      if (err) rows = [];
+
+      const seenTripIds = new Set(rows.map(r => r.trip_id).filter(Boolean));
+      let combinedRows = [...rows];
+
+      // Merge with scheduled GTFS static route trips with flexible key lookups
+      const staticTrips = routeDisplayToTripsMap[routeDisplay] || routeDisplayToTripsMap[altRouteDisplay] || [];
+      
+      staticTrips.forEach(st => {
+        if (isServiceActiveOnDate(st.service_id, day)) {
+          const tId = st.trip_id;
+          const baseId = extractBaseTripId(tId);
+          if (!seenTripIds.has(tId) && !seenTripIds.has(baseId)) {
+            seenTripIds.add(tId);
+
+            const delaySec = delaysByTrip[tId] || delaysByTrip[baseId];
+            const tardiness = formatTardiness(delaySec);
+
+            combinedRows.push({
+              vehicle_id: 'Scheduled',
+              trip_id: tId,
+              route_display: st.route_display || routeDisplay,
+              origin: st.origin,
+              destination: st.destination,
+              day: day,
+              start_time: st.start_time,
+              tardiness: tardiness,
+              created_at: null
+            });
+          }
+        }
+      });
+
+      // Deduplicate and prioritize live logged data over scheduled placeholders
+      const uniqueMap = new Map();
+      combinedRows.forEach(r => {
+        const key = `${r.start_time}_${r.origin}_${r.destination}`;
+        if (!uniqueMap.has(key)) {
+          uniqueMap.set(key, r);
+        } else {
+          const existing = uniqueMap.get(key);
+          if (r.vehicle_id !== 'Scheduled' && existing.vehicle_id === 'Scheduled') {
+            uniqueMap.set(key, r);
+          }
+        }
+      });
+
+      let finalRows = Array.from(uniqueMap.values());
+      finalRows.sort((a, b) => timeStrToMinutes(b.start_time) - timeStrToMinutes(a.start_time));
+
+      res.json(finalRows);
     }
   );
 });
