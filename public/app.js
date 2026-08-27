@@ -21,21 +21,71 @@ if (searchDropdown) {
   L.DomEvent.disableScrollPropagation(searchDropdown);
 }
 
-// Special and express route prefixes that must be treated as ROUTES (not vehicle fleet IDs)
 const KNOWN_EXPRESS_ROUTES = new Set([
   'NX1', 'NX2', 'WX1', 'CTY', 'TMK', 'AIR', 'INN', 'OUT', 'STH', 'EAST', 'WEST', 'ONE', 'DEV', 'RANG', 'MTIA', 'HOBS', 'GULF', 'HMB', 'PINE', 'MTID', 'BAYS', 'BIRK', 'TIRI', 'F', 'WSTH', 'S-C', 'E-W', 'O-W'
 ]);
 
 /**
- * Standard 24-hour time conversion into minutes from 00:00 (Midnight) to 23:59 (11:59 PM).
- * 12:00 AM parses strictly to 0 minutes.
+ * Helper: Safely extracts departure/start time across flexible API field names.
+ */
+function getTripStartTime(trip) {
+  if (!trip || typeof trip !== 'object') return '';
+  return trip.start_time || 
+         trip.departure_time || 
+         trip.scheduled_departure || 
+         trip.start_time_iso || 
+         trip.time || 
+         trip.origin_departure_time || '';
+}
+
+/**
+ * Helper: Safely extracts vehicle ID across flexible API field names.
+ */
+function getTripVehicleId(trip) {
+  if (!trip || typeof trip !== 'object') return '';
+  return trip.vehicle_id || trip.fleet_id || trip.bus_id || trip.vehicle || '';
+}
+
+/**
+ * Helper: Escapes HTML strings to prevent rendering issues and attribute syntax breakage.
+ */
+function escapeHtml(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+/**
+ * Helper: Normalizes a date into YYYY-MM-DD string.
+ */
+function toDateStr(dateObj) {
+  if (!(dateObj instanceof Date) || isNaN(dateObj.getTime())) return '';
+  const y = dateObj.getFullYear();
+  const m = String(dateObj.getMonth() + 1).padStart(2, '0');
+  const d = String(dateObj.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+/**
+ * Parses time into minutes from midnight (0 to 1439).
+ * Handles HH:MM, HH:MM:SS, 12-hour AM/PM, and ISO string variations.
  */
 function parseTimeToMinutes(timeStr) {
   if (!timeStr) return 0;
   let s = String(timeStr).trim();
   
-  if (s.includes('T') || (s.includes(' ') && s.includes('-'))) {
-    const parts = s.split(/[\sT]/);
+  if (s.includes('T')) {
+    const parsedDate = new Date(s);
+    if (!isNaN(parsedDate.getTime())) {
+      return parsedDate.getHours() * 60 + parsedDate.getMinutes();
+    }
+    s = s.split('T')[1];
+  } else if (s.includes(' ') && s.includes('-')) {
+    const parts = s.split(/\s+/);
     s = parts[parts.length - 1];
   }
 
@@ -49,57 +99,130 @@ function parseTimeToMinutes(timeStr) {
   if (ampm) {
     if (ampm === 'PM' && hours < 12) hours += 12;
     if (ampm === 'AM' && hours === 12) hours = 0;
+  } else {
+    if (hours >= 24) hours = hours % 24;
   }
 
   return hours * 60 + minutes;
 }
 
 /**
- * Converts ISO timestamps or raw dates into local YYYY-MM-DD strings
- * using local system time to prevent UTC day shifts.
+ * Formats time into clean 12-hour AM/PM format.
  */
-function getShiftLocalDate(shift) {
-  const rawDate = shift.date || shift.trip_date || shift.timestamp || '';
-  if (!rawDate) return '';
-  const str = String(rawDate).trim();
-  
-  if (str.includes('T') || str.includes('Z')) {
-    const d = new Date(str);
-    if (!isNaN(d.getTime())) {
-      const y = d.getFullYear();
-      const m = String(d.getMonth() + 1).padStart(2, '0');
-      const day = String(d.getDate()).padStart(2, '0');
-      return `${y}-${m}-${day}`;
+function format12HourTime(rawTime) {
+  if (!rawTime) return 'N/A';
+  let s = String(rawTime).trim();
+
+  if (s.includes('T')) {
+    const parsedDate = new Date(s);
+    if (!isNaN(parsedDate.getTime())) {
+      let h = parsedDate.getHours();
+      const m = String(parsedDate.getMinutes()).padStart(2, '0');
+      const ampm = h >= 12 ? 'PM' : 'AM';
+      h = h % 12 || 12;
+      return `${h}:${m} ${ampm}`;
     }
+    s = s.split('T')[1];
   }
-  return str.split('T')[0];
-}
 
-/**
- * Ensures 24-hour time strings or raw timestamps format properly in 12-hour AM/PM format.
- */
-function format12HourTime(timeStr) {
-  if (!timeStr) return 'N/A';
-  let s = String(timeStr).trim();
-
-  if (/AM|PM/i.test(s)) return s;
-
-  if (s.includes('T') || s.includes(' ')) {
-    const parts = s.split(/[\sT]/);
+  // Guard added to ensure we don't sever AM/PM format strings like "12:00 AM"
+  if (s.includes(' ') && s.includes('-')) {
+    const parts = s.split(/\s+/);
     s = parts[parts.length - 1];
   }
 
-  const match = s.match(/^(\d{1,2}):(\d{2})/);
-  if (!match) return s;
+  const match = s.match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?$/i);
+  if (!match) return s || 'N/A';
 
   let hours = parseInt(match[1], 10);
   const minutes = match[2];
+  const ampm = match[3] ? match[3].toUpperCase() : null;
+
+  if (ampm) {
+    if (hours === 0) hours = 12;
+    return `${hours}:${minutes} ${ampm}`;
+  }
+
+  if (hours >= 24) hours = hours % 24;
 
   const period = hours >= 12 ? 'PM' : 'AM';
-  hours = hours % 12;
-  if (hours === 0) hours = 12;
+  hours = hours % 12 || 12;
 
   return `${hours}:${minutes} ${period}`;
+}
+
+/**
+ * Helper: Determines if a start time is early morning (12:00 AM - 3:59 AM / 0 - 239 mins).
+ */
+function isEarlyMorningTrip(timeStr) {
+  const mins = parseTimeToMinutes(timeStr);
+  return mins >= 0 && mins < 240;
+}
+
+/**
+ * Converts ISO timestamps or raw dates into local YYYY-MM-DD strings.
+ */
+function getShiftLocalDate(shift) {
+  if (!shift || typeof shift !== 'object') return '';
+
+  const rawDate = shift.day || // Added direct support for SQL 'day' column
+                  shift.date || 
+                  shift.service_date || 
+                  shift.timestamp || 
+                  shift.start_time_iso || 
+                  getTripStartTime(shift) ||
+                  shift.operating_date || 
+                  shift.start_date || 
+                  shift.departure_date || '';
+
+  if (!rawDate) return '';
+  const str = String(rawDate).trim();
+
+  if (str.includes('T')) {
+    return str.split('T')[0];
+  }
+
+  if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(str)) {
+    const [d, m, y] = str.split('/');
+    return `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(str)) {
+    return str;
+  }
+
+  const parsed = new Date(str);
+  if (!isNaN(parsed.getTime())) {
+    return toDateStr(parsed);
+  }
+
+  return '';
+}
+
+/**
+ * Filters shift trips for a target selected date.
+ */
+function processShiftTrips(shiftTrips, selectedDateStr) {
+  if (!Array.isArray(shiftTrips) || shiftTrips.length === 0) return [];
+  if (!selectedDateStr) return shiftTrips;
+
+  return shiftTrips
+    .filter(trip => {
+      const tripDate = getShiftLocalDate(trip);
+      if (!tripDate) return true; // Safe fallback if server didn't embed date attribute
+
+      // Exact match on physical date
+      return tripDate === selectedDateStr;
+    })
+    .map(trip => {
+      const startTime = getTripStartTime(trip);
+      const isEarly = isEarlyMorningTrip(startTime);
+
+      return {
+        ...trip,
+        commencedYesterday: isEarly
+      };
+    });
 }
 
 function parseSearchQuery(rawInput) {
@@ -151,7 +274,7 @@ function createBusIcon(routeDisplay) {
 
   return L.divIcon({
     className: 'custom-bus-icon',
-    html: `<div class="bus-marker-badge ${isNis ? 'nis' : ''}">${displayLabel}</div>`,
+    html: `<div class="bus-marker-badge ${isNis ? 'nis' : ''}">${escapeHtml(displayLabel)}</div>`,
     iconSize: [38, 38],
     iconAnchor: [19, 19]
   });
@@ -161,43 +284,64 @@ async function fetchAndRenderBuses() {
   try {
     const res = await fetch('/api/buses/live');
     if (!res.ok) return;
-    allBusesData = await res.json();
-    renderAllBusesOnMap();
+    const data = await res.json();
+    if (Array.isArray(data)) {
+      allBusesData = data;
+      renderAllBusesOnMap();
+    }
   } catch (err) {
     console.error('Error fetching live bus locations:', err);
   }
 }
 
 function renderAllBusesOnMap() {
+  const currentVehicleIds = new Set();
+
   allBusesData.forEach((bus) => {
-    const fleetLabel = formatFleetLabel(bus.vehicle_id);
+    const lat = parseFloat(bus.latitude);
+    const lng = parseFloat(bus.longitude);
+    if (isNaN(lat) || isNaN(lng)) return;
+
+    const vehicleId = String(getTripVehicleId(bus));
+    currentVehicleIds.add(vehicleId);
+
+    const fleetLabel = formatFleetLabel(vehicleId);
     const tripTitle = formatTripTitle(bus.route_display, bus.origin, bus.destination);
     const routeDisplay = bus.route_display || 'NIS';
-    const departureTimeFormatted = format12HourTime(bus.start_time);
+    const departureTimeFormatted = format12HourTime(getTripStartTime(bus));
+    const tardinessDisplay = bus.tardiness || 'On Time';
+    const occupancyDisplay = bus.occupancy || 'Unknown';
 
     const popupContent = `
       <div class="popup-container">
-        <h3>${fleetLabel}</h3>
-        <p><strong>Trip:</strong> ${tripTitle}</p>
-        <p><strong>Departure Time:</strong> ${departureTimeFormatted}</p>
-        <p><strong>Status:</strong> ${bus.tardiness}</p>
-        <p><strong>Occupancy:</strong> ${bus.occupancy}</p>
-        <button class="btn-history" onclick="openShiftHistory('${bus.vehicle_id}')">View Shift History</button>
+        <h3>${escapeHtml(fleetLabel)}</h3>
+        <p><strong>Trip:</strong> ${escapeHtml(tripTitle)}</p>
+        <p><strong>Departure Time:</strong> ${escapeHtml(departureTimeFormatted)}</p>
+        <p><strong>Status:</strong> ${escapeHtml(tardinessDisplay)}</p>
+        <p><strong>Occupancy:</strong> ${escapeHtml(occupancyDisplay)}</p>
+        <button class="btn-history" onclick="openShiftHistory('${escapeHtml(vehicleId)}')">View Shift History</button>
       </div>
     `;
 
-    if (busMarkers[bus.vehicle_id]) {
-      busMarkers[bus.vehicle_id].setLatLng([bus.latitude, bus.longitude]);
-      busMarkers[bus.vehicle_id].setIcon(createBusIcon(routeDisplay));
-      busMarkers[bus.vehicle_id].getPopup().setContent(popupContent);
-      if (!map.hasLayer(busMarkers[bus.vehicle_id])) {
-        busMarkers[bus.vehicle_id].addTo(map);
+    if (busMarkers[vehicleId]) {
+      busMarkers[vehicleId].setLatLng([lat, lng]);
+      busMarkers[vehicleId].setIcon(createBusIcon(routeDisplay));
+      busMarkers[vehicleId].getPopup().setContent(popupContent);
+      if (!map.hasLayer(busMarkers[vehicleId])) {
+        busMarkers[vehicleId].addTo(map);
       }
     } else {
       const icon = createBusIcon(routeDisplay);
-      const marker = L.marker([bus.latitude, bus.longitude], { icon }).addTo(map);
+      const marker = L.marker([lat, lng], { icon }).addTo(map);
       marker.bindPopup(popupContent);
-      busMarkers[bus.vehicle_id] = marker;
+      busMarkers[vehicleId] = marker;
+    }
+  });
+
+  Object.keys(busMarkers).forEach((vId) => {
+    if (!currentVehicleIds.has(vId)) {
+      map.removeLayer(busMarkers[vId]);
+      delete busMarkers[vId];
     }
   });
 }
@@ -211,6 +355,8 @@ function handleSearch() {
   const rawQuery = (document.getElementById('bus-search')?.value || '').trim();
   const dropdown = document.getElementById('search-results');
 
+  if (!dropdown) return;
+
   if (!rawQuery) {
     dropdown.style.display = 'none';
     dropdown.innerHTML = '';
@@ -222,14 +368,15 @@ function handleSearch() {
   let html = '';
 
   if (parsed.type === 'route') {
-    html += `<div class="search-route-header" onclick="openRouteHistoryModal('${parsed.query}')">View Full Route History for ${parsed.query}</div>`;
+    html += `<div class="search-route-header" onclick="openRouteHistoryModal('${escapeHtml(parsed.query)}')">View Full Route History for ${escapeHtml(parsed.query)}</div>`;
   } else if (parsed.type === 'vehicle') {
-    html += `<div class="search-route-header" onclick="openShiftHistory('${parsed.query}')">View Vehicle History for ${parsed.query}</div>`;
+    html += `<div class="search-route-header" onclick="openShiftHistory('${escapeHtml(parsed.query)}')">View Vehicle History for ${escapeHtml(parsed.query)}</div>`;
   }
 
   const matches = allBusesData.filter((bus) => {
-    const fleetLabel = formatFleetLabel(bus.vehicle_id).toLowerCase();
-    const rawId = String(bus.vehicle_id).toLowerCase();
+    const vId = getTripVehicleId(bus);
+    const fleetLabel = formatFleetLabel(vId).toLowerCase();
+    const rawId = String(vId).toLowerCase();
     const route = String(bus.route_display || '').toLowerCase();
     const dest = String(bus.destination || '').toLowerCase();
     const orig = String(bus.origin || '').toLowerCase();
@@ -238,17 +385,18 @@ function handleSearch() {
   }).slice(0, 15);
 
   matches.forEach((bus) => {
-    const fleetLabel = formatFleetLabel(bus.vehicle_id);
+    const vId = getTripVehicleId(bus);
+    const fleetLabel = formatFleetLabel(vId);
     const tripTitle = formatTripTitle(bus.route_display, bus.origin, bus.destination);
     const badgeText = bus.route_display || 'NIS';
 
     html += `
-      <div class="search-result-item" onclick="selectBusFromSearch('${bus.vehicle_id}')">
+      <div class="search-result-item" onclick="selectBusFromSearch('${escapeHtml(vId)}')">
         <div>
-          <div class="result-fleet">${fleetLabel}</div>
-          <div class="result-trip">${tripTitle}</div>
+          <div class="result-fleet">${escapeHtml(fleetLabel)}</div>
+          <div class="result-trip">${escapeHtml(tripTitle)}</div>
         </div>
-        <div class="result-badge">${badgeText}</div>
+        <div class="result-badge">${escapeHtml(badgeText)}</div>
       </div>
     `;
   });
@@ -258,14 +406,18 @@ function handleSearch() {
 }
 
 function selectBusFromSearch(vehicleId) {
-  const bus = allBusesData.find(b => String(b.vehicle_id) === String(vehicleId));
+  const bus = allBusesData.find(b => String(getTripVehicleId(b)) === String(vehicleId));
   const dropdown = document.getElementById('search-results');
   
   if (dropdown) dropdown.style.display = 'none';
 
   if (bus && busMarkers[vehicleId]) {
-    map.setView([bus.latitude, bus.longitude], 16);
-    busMarkers[vehicleId].openPopup();
+    const lat = parseFloat(bus.latitude);
+    const lng = parseFloat(bus.longitude);
+    if (!isNaN(lat) && !isNaN(lng)) {
+      map.setView([lat, lng], 16);
+      busMarkers[vehicleId].openPopup();
+    }
   }
 }
 
@@ -304,13 +456,14 @@ async function openShiftHistory(vehicleId) {
     initSevenDayDateDropdown();
 
     const res = await fetch(`/api/history/bus/${encodeURIComponent(vehicleId)}`);
-    let history = await res.json();
-
-    if (history && history.length > 0) {
-      history.sort((a, b) => parseTimeToMinutes(b.start_time) - parseTimeToMinutes(a.start_time));
-    }
+    if (!res.ok) throw new Error(`HTTP error ${res.status}`);
     
-    allSevenDayShifts = history || [];
+    let history = await res.json();
+    if (!Array.isArray(history)) history = [];
+
+    history.sort((a, b) => parseTimeToMinutes(getTripStartTime(b)) - parseTimeToMinutes(getTripStartTime(a)));
+    
+    allSevenDayShifts = history;
     renderSevenDayShiftHistory();
   } catch (err) {
     console.error('Error opening shift history:', err);
@@ -332,11 +485,7 @@ function initSevenDayDateDropdown() {
     const d = new Date(today);
     d.setDate(today.getDate() - i);
     
-    const year = d.getFullYear();
-    const month = String(d.getMonth() + 1).padStart(2, '0');
-    const day = String(d.getDate()).padStart(2, '0');
-    const dateStr = `${year}-${month}-${day}`;
-    
+    const dateStr = toDateStr(d);
     const dayName = d.toLocaleDateString('en-NZ', { weekday: 'long' });
 
     const option = document.createElement('option');
@@ -356,36 +505,14 @@ function renderSevenDayShiftHistory() {
   const searchInput = document.getElementById('shift-history-search');
   const query = searchInput ? searchInput.value.toLowerCase().trim() : '';
 
-  let selectedDayName = '';
-  if (selectedDate) {
-    try {
-      selectedDayName = new Date(selectedDate + 'T00:00:00').toLocaleDateString('en-NZ', { weekday: 'long' }).toLowerCase();
-    } catch (e) {}
-  }
+  const dateFiltered = processShiftTrips(allSevenDayShifts, selectedDate);
 
-  const filtered = allSevenDayShifts.filter((shift) => {
-    const shiftDay = String(shift.day || '').trim();
-    const shiftDate = getShiftLocalDate(shift);
-    const shiftDayLower = shiftDay.toLowerCase();
-
-    // STRICT DATE MATCHING: Exclude shifts that belong to a different calendar date
-    if (selectedDate && shiftDate && shiftDate !== selectedDate && shiftDate !== '') {
-      // Allow fallback matching only if shiftDate is empty, otherwise enforce strict match
-      if (shiftDate !== selectedDate) return false;
-    }
-
-    const matchesDate = !selectedDate || 
-      shiftDate === selectedDate || 
-      shiftDay === selectedDate || 
-      shiftDayLower === selectedDate.toLowerCase() ||
-      (selectedDayName && shiftDayLower === selectedDayName);
-
-    if (!matchesDate) return false;
-
+  const filtered = dateFiltered.filter((shift) => {
     if (!query) return true;
+    const startTime = getTripStartTime(shift);
     const route = String(shift.route_display || '').toLowerCase();
     const dest = String(shift.destination || '').toLowerCase();
-    const time = format12HourTime(shift.start_time).toLowerCase();
+    const time = format12HourTime(startTime).toLowerCase();
     const tardiness = String(shift.tardiness || '').toLowerCase();
     const tripTitle = formatTripTitle(shift.route_display, shift.origin, shift.destination).toLowerCase();
 
@@ -398,19 +525,22 @@ function renderSevenDayShiftHistory() {
   }
 
   container.innerHTML = filtered.map((shift) => {
+    const startTime = getTripStartTime(shift);
+    const vId = getTripVehicleId(shift);
     const tripTitle = formatTripTitle(shift.route_display, shift.origin, shift.destination);
-    const isScheduled = !shift.vehicle_id || String(shift.vehicle_id).toUpperCase() === 'SCHEDULED';
+    const isScheduled = !vId || String(vId).toUpperCase() === 'SCHEDULED';
     const tardinessDisplay = isScheduled ? 'Scheduled' : (shift.tardiness || 'On Time');
-    const timeDisplay = format12HourTime(shift.start_time);
+    const timeDisplay = format12HourTime(startTime);
+    const commencedTag = getCommencedTag(startTime, selectedDate);
 
     return `
       <div class="departure-row" style="background: #fff; border: 1px solid #e1e4e8; border-radius: 8px; padding: 12px; margin-bottom: 8px;">
         <div class="departure-main-info" style="display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 4px;">
-          <span>Start: <strong>${timeDisplay}</strong></span>
-          <span><strong>${tardinessDisplay}</strong></span>
+          <span>Start: <strong>${escapeHtml(timeDisplay)}</strong>${commencedTag}</span>
+          <span><strong>${escapeHtml(tardinessDisplay)}</strong></span>
         </div>
         <div style="font-size: 13px; font-weight: 600; color: #222;">
-          ${tripTitle}
+          ${escapeHtml(tripTitle)}
         </div>
       </div>
     `;
@@ -434,19 +564,22 @@ async function openRouteHistoryModal(routeDisplay, specificTrip = null) {
   const dateSelect = document.getElementById('route-date-select');
   try {
     const res = await fetch(`/api/history/route-days/${encodeURIComponent(routeDisplay)}`);
+    if (!res.ok) throw new Error(`HTTP error ${res.status}`);
+    
     let days = await res.json();
+    if (!Array.isArray(days)) days = [];
 
     const now = new Date();
-    const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    const todayStr = toDateStr(now);
 
-    if (!days || days.length === 0) {
+    if (days.length === 0) {
       days = [todayStr];
     } else if (!days.includes(todayStr)) {
       days.unshift(todayStr);
     }
 
     if (dateSelect) {
-      dateSelect.innerHTML = days.map(d => `<option value="${d}">${d}</option>`).join('');
+      dateSelect.innerHTML = days.map(d => `<option value="${escapeHtml(d)}">${escapeHtml(d)}</option>`).join('');
     }
 
     const routeModal = document.getElementById('route-history-modal');
@@ -461,6 +594,7 @@ async function openRouteHistoryModal(routeDisplay, specificTrip = null) {
 function getDayOfWeekName(dateStr) {
   try {
     const d = new Date(dateStr + 'T00:00:00');
+    if (isNaN(d.getTime())) return '';
     return d.toLocaleDateString('en-US', { weekday: 'long' });
   } catch (e) {
     return '';
@@ -470,7 +604,7 @@ function getDayOfWeekName(dateStr) {
 async function loadRouteHistoryForSelectedDate() {
   const dateSelect = document.getElementById('route-date-select');
   const now = new Date();
-  const defaultToday = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const defaultToday = toDateStr(now);
   const selectedDate = dateSelect ? dateSelect.value : defaultToday;
   
   const dayOfWeek = getDayOfWeekName(selectedDate);
@@ -496,19 +630,51 @@ async function loadRouteHistoryForSelectedDate() {
 
   try {
     const res = await fetch(`/api/history/route/${encodeURIComponent(activeRouteDisplay)}?day=${encodeURIComponent(selectedDate)}`);
-    activeRouteShifts = await res.json();
+    if (!res.ok) throw new Error(`HTTP error ${res.status}`);
+    
+    let shifts = await res.json();
+    if (!Array.isArray(shifts)) shifts = [];
+
+    activeRouteShifts = shifts;
 
     if (!activeRouteShifts || activeRouteShifts.length === 0) {
-      departuresList.innerHTML = `<p style="color: #666; text-align: center; padding: 20px;">No recorded history for ${activeRouteDisplay} on ${selectedDate}.</p>`;
+      departuresList.innerHTML = `<p style="color: #666; text-align: center; padding: 20px;">No recorded history for ${escapeHtml(activeRouteDisplay)} on ${escapeHtml(selectedDate)}.</p>`;
       return;
     }
 
-    activeRouteShifts.sort((a, b) => parseTimeToMinutes(b.start_time) - parseTimeToMinutes(a.start_time));
+    activeRouteShifts.sort((a, b) => {
+      let aMins = parseTimeToMinutes(getTripStartTime(a));
+      let bMins = parseTimeToMinutes(getTripStartTime(b));
+      if (aMins < 240) aMins += 1440;
+      if (bMins < 240) bMins += 1440;
+      return bMins - aMins;
+    });
 
     renderFilteredRouteDepartures();
   } catch (err) {
     console.error('Error loading route history:', err);
+    departuresList.innerHTML = `<p style="color: #d9381e; text-align: center; padding: 20px;">Failed to load route departures.</p>`;
   }
+}
+
+/**
+ * Generates "(commenced on DD/MM/YYYY)" tag for early morning runs.
+ * Now steps backward one day, as the physical date stems from the continuation of the previous evening.
+ */
+function getCommencedTag(startTimeStr, selectedDateStr) {
+  if (!isEarlyMorningTrip(startTimeStr) || !selectedDateStr) return '';
+
+  const [y, m, d] = selectedDateStr.split('-').map(Number);
+  if (!y || !m || !d) return '';
+
+  const actualDate = new Date(y, m - 1, d - 1);
+  if (isNaN(actualDate.getTime())) return '';
+
+  const day = String(actualDate.getDate()).padStart(2, '0');
+  const month = String(actualDate.getMonth() + 1).padStart(2, '0');
+  const year = actualDate.getFullYear();
+
+  return ` <span style="font-size: 11px; color: #555; font-weight: 500;">(commenced on ${day}/${month}/${year})</span>`;
 }
 
 function renderFilteredRouteDepartures() {
@@ -517,7 +683,7 @@ function renderFilteredRouteDepartures() {
 
   const dateSelect = document.getElementById('route-date-select');
   const now = new Date();
-  const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const todayStr = toDateStr(now);
   const selectedDate = dateSelect ? dateSelect.value : todayStr;
   const currentMinutes = now.getHours() * 60 + now.getMinutes();
 
@@ -525,19 +691,15 @@ function renderFilteredRouteDepartures() {
   const query = searchInput ? searchInput.value.toLowerCase().trim() : '';
 
   const filtered = activeRouteShifts.filter((shift) => {
-    // STRICT CALENDAR DATE MATCHING: Completely excludes trips belonging to other dates (prevents 12:00 AM bleeding into previous days)
-    const shiftDate = getShiftLocalDate(shift);
-    if (selectedDate && shiftDate && shiftDate !== selectedDate) {
-      return false;
-    }
-
     if (!query) return true;
-    const startTime = format12HourTime(shift.start_time).toLowerCase();
-    const fleet = formatFleetLabel(shift.vehicle_id).toLowerCase();
+    const startTime = getTripStartTime(shift);
+    const vId = getTripVehicleId(shift);
+    const formattedStartTime = format12HourTime(startTime).toLowerCase();
+    const fleet = formatFleetLabel(vId).toLowerCase();
     const route = String(shift.route_display || '').toLowerCase();
     const dest = formatCleanDestination(shift.destination).toLowerCase();
 
-    return startTime.includes(query) || 
+    return formattedStartTime.includes(query) || 
            fleet.includes(query) || 
            route.includes(query) || 
            dest.includes(query);
@@ -549,18 +711,24 @@ function renderFilteredRouteDepartures() {
   }
 
   departuresList.innerHTML = filtered.map((shift) => {
+    const startTime = getTripStartTime(shift);
+    const vId = getTripVehicleId(shift);
     const tripTitle = formatTripTitle(shift.route_display, shift.origin, shift.destination);
-    const formattedStartTime = format12HourTime(shift.start_time);
-    const shiftMinutes = parseTimeToMinutes(shift.start_time);
+    const formattedStartTime = format12HourTime(startTime);
+    const shiftMinutes = parseTimeToMinutes(startTime);
+    const commencedTag = getCommencedTag(startTime, selectedDate);
     
-    const isTarget = targetTripContext && 
-                     String(shift.vehicle_id) === String(targetTripContext.vehicle_id) && 
-                     String(shift.start_time) === String(targetTripContext.start_time);
+    const targetVId = targetTripContext ? getTripVehicleId(targetTripContext) : '';
+    const targetStartTime = targetTripContext ? getTripStartTime(targetTripContext) : '';
 
-    const isScheduled = !shift.vehicle_id || String(shift.vehicle_id).toUpperCase() === 'SCHEDULED';
+    const isTarget = targetTripContext && 
+                     String(vId) === String(targetVId) && 
+                     String(startTime) === String(targetStartTime);
+
+    const isScheduled = !vId || String(vId).toUpperCase() === 'SCHEDULED';
     const fleetDisplay = isScheduled 
       ? `<span style="color: #888; font-style: italic;">Scheduled</span>` 
-      : `<strong>${formatFleetLabel(shift.vehicle_id)}</strong>`;
+      : `<strong>${escapeHtml(formatFleetLabel(vId))}</strong>`;
 
     let tardinessDisplay = shift.tardiness || 'Scheduled';
     if (isScheduled || selectedDate > todayStr || (selectedDate === todayStr && shiftMinutes > currentMinutes)) {
@@ -571,72 +739,107 @@ function renderFilteredRouteDepartures() {
       <div class="departure-row ${isTarget ? 'highlighted-target-trip' : ''}">
         ${isTarget ? '<span class="target-badge">Selected Route Trip</span>' : ''}
         <div class="departure-main-info">
-          <span>Start: <strong>${formattedStartTime}</strong> | Fleet: ${fleetDisplay}</span>
-          <span><strong>${tardinessDisplay}</strong></span>
+          <span>Start: <strong>${escapeHtml(formattedStartTime)}</strong>${commencedTag} | Fleet: ${fleetDisplay}</span>
+          <span><strong>${escapeHtml(tardinessDisplay)}</strong></span>
         </div>
-        <div style="font-size: 13px; font-weight: 600; color: #222;">${tripTitle}</div>
-        ${isScheduled ? '' : `<button class="btn-shift-check" onclick="toggleShiftCheck(this, '${shift.vehicle_id}', '${shift.start_time}', '${shift.route_display}')">Check Shift</button>`}
+        <div style="font-size: 13px; font-weight: 600; color: #222;">${escapeHtml(tripTitle)}</div>
+        ${isScheduled ? '' : `
+          <button class="btn-shift-check" 
+                  data-vehicle-id="${escapeHtml(vId)}" 
+                  data-start-time="${escapeHtml(startTime)}" 
+                  data-route="${escapeHtml(shift.route_display || '')}" 
+                  onclick="handleShiftCheckClick(this)">Check Shift</button>
+        `}
         <div class="shift-details-box"></div>
       </div>
     `;
   }).join('');
 }
 
-async function toggleShiftCheck(btnEl, vehicleId, targetStartTime, targetRouteDisplay) {
+async function handleShiftCheckClick(btnEl) {
+  const vehicleId = btnEl.getAttribute('data-vehicle-id');
+  const targetStartTime = btnEl.getAttribute('data-start-time');
+  const targetRouteDisplay = btnEl.getAttribute('data-route');
+
   const row = btnEl.closest('.departure-row');
+  if (!row) return;
+
   const detailsBox = row.querySelector('.shift-details-box');
+  if (!detailsBox) return;
 
   if (detailsBox.style.display === 'block') {
     detailsBox.style.display = 'none';
     return;
   }
 
+  const dateSelect = document.getElementById('route-date-select');
+  const targetDate = dateSelect ? dateSelect.value : '';
+
   try {
     const res = await fetch(`/api/history/bus/${encodeURIComponent(vehicleId)}`);
+    if (!res.ok) throw new Error(`HTTP error ${res.status}`);
+    
     let history = await res.json();
+    if (!Array.isArray(history)) history = [];
 
-    if (!history || history.length === 0) {
-      detailsBox.innerHTML = 'No recent shift details found for this vehicle.';
+    if (history.length === 0) {
+      detailsBox.innerHTML = '<p style="margin: 0; color: #666;">No recent shift details found for this vehicle.</p>';
       detailsBox.style.display = 'block';
       return;
     }
 
-    history.sort((a, b) => parseTimeToMinutes(b.start_time) - parseTimeToMinutes(a.start_time));
+    const filteredHistory = processShiftTrips(history, targetDate);
 
-    row._vehicleHistory = history;
+    filteredHistory.sort((a, b) => {
+      let aM = parseTimeToMinutes(getTripStartTime(a));
+      let bM = parseTimeToMinutes(getTripStartTime(b));
+      if (aM < 240) aM += 1440;
+      if (bM < 240) bM += 1440;
+      return bM - aM;
+    });
+
+    const historyToUse = filteredHistory.length > 0 ? filteredHistory : history;
+
+    row._vehicleHistory = historyToUse;
     row._targetStartTime = targetStartTime;
     row._targetRouteDisplay = targetRouteDisplay;
 
     detailsBox.innerHTML = `
-      <div style="font-weight: 700; margin-bottom: 6px; color: #111;">This Shift:</div>
+      <div style="font-weight: 700; margin-bottom: 6px; color: #111;">Shift Details (${escapeHtml(targetDate)}):</div>
       <input type="text" placeholder="Filter shift trips..." 
         style="width: 100%; padding: 6px 10px; margin-bottom: 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; box-sizing: border-box;"
         oninput="filterShiftDetails(this)" />
       <ul class="shift-details-list" style="margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 5px;">
-        ${renderShiftListItems(history, targetStartTime, targetRouteDisplay)}
+        ${renderShiftListItems(historyToUse, targetStartTime, targetRouteDisplay, targetDate)}
       </ul>
     `;
     detailsBox.style.display = 'block';
 
     detailsBox.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   } catch (e) {
-    detailsBox.innerHTML = 'Could not load shift details.';
+    detailsBox.innerHTML = '<p style="margin: 0; color: #d9381e;">Could not load shift details.</p>';
     detailsBox.style.display = 'block';
     detailsBox.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
 }
 
-function renderShiftListItems(history, targetStartTime, targetRouteDisplay) {
+function renderShiftListItems(history, targetStartTime, targetRouteDisplay, targetDate) {
+  const targetMins = parseTimeToMinutes(targetStartTime);
+
   return history.map(h => {
-    const isThisRun = (String(h.start_time) === String(targetStartTime) && String(h.route_display) === String(targetRouteDisplay));
-    const formattedTime = format12HourTime(h.start_time);
-    
+    const hStartTime = getTripStartTime(h);
+    const hMins = parseTimeToMinutes(hStartTime);
+
+    const isThisRun = (hMins === targetMins && String(h.route_display || '').trim().toUpperCase() === String(targetRouteDisplay || '').trim().toUpperCase());
+    const formattedTime = format12HourTime(hStartTime);
+    const commencedTag = getCommencedTag(hStartTime, targetDate);
+
     let destText = formatCleanDestination(h.destination);
-    let destDisplay = destText ? ` to <strong>${destText}</strong>` : '';
+    let destDisplay = destText ? ` to <strong>${escapeHtml(destText)}</strong>` : '';
 
     return `
-      <li style="${isThisRun ? 'color: #d9381e;' : ''}">
-        ${formattedTime} - ${h.route_display}${destDisplay} (${h.tardiness})
+      <li style="${isThisRun ? 'color: #d9381e; font-weight: 600;' : ''}">
+        ${escapeHtml(formattedTime)} - ${escapeHtml(h.route_display || '')}${destDisplay} (${escapeHtml(h.tardiness || 'On Time')})${commencedTag}
         ${isThisRun ? '<span style="color: #d9381e; font-weight: 700; margin-left: 6px;">(this run)</span>' : ''}
       </li>
     `;
@@ -651,14 +854,18 @@ function filterShiftDetails(inputEl) {
   const listEl = row.querySelector('.shift-details-list');
   if (!listEl) return;
 
+  const dateSelect = document.getElementById('route-date-select');
+  const targetDate = dateSelect ? dateSelect.value : '';
+
   const filtered = row._vehicleHistory.filter(h => {
     if (!query) return true;
-    const startTime = format12HourTime(h.start_time).toLowerCase();
+    const startTime = getTripStartTime(h);
+    const timeFormatted = format12HourTime(startTime).toLowerCase();
     const route = String(h.route_display || '').toLowerCase();
     const dest = formatCleanDestination(h.destination).toLowerCase();
     const tardiness = String(h.tardiness || '').toLowerCase();
 
-    return startTime.includes(query) || 
+    return timeFormatted.includes(query) || 
            route.includes(query) || 
            dest.includes(query) || 
            tardiness.includes(query);
@@ -669,7 +876,7 @@ function filterShiftDetails(inputEl) {
     return;
   }
 
-  listEl.innerHTML = renderShiftListItems(filtered, row._targetStartTime, row._targetRouteDisplay);
+  listEl.innerHTML = renderShiftListItems(filtered, row._targetStartTime, row._targetRouteDisplay, targetDate);
 }
 
 function closeModal() {

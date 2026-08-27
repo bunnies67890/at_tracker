@@ -21,6 +21,12 @@
       z-index: 1; 
     }
 
+    /* Prevent Leaflet default divIcon container styling from obscuring badge */
+    .custom-bus-icon {
+      background: transparent !important;
+      border: none !important;
+    }
+
     /* Prevent iOS auto-zoom on focused inputs */
     input[type="text"],
     input[type="search"],
@@ -300,6 +306,19 @@
       border-left: 3px solid #0056b3;
       margin-top: 4px;
     }
+
+    /* Badge for Overnight Operational Carryover Trips */
+    .commenced-yesterday-badge {
+      display: inline-block;
+      background: #fff3cd;
+      color: #856404;
+      border: 1px solid #ffeeba;
+      border-radius: 4px;
+      padding: 1px 6px;
+      font-size: 11px;
+      font-weight: 600;
+      margin-left: 6px;
+    }
   </style>
 </head>
 <body>
@@ -313,7 +332,8 @@
       placeholder="Search Route or Vehicle..." 
       autocomplete="off" 
       autocorrect="off"
-      capitalize="off"
+      autocapitalize="none"
+      aria-label="Search Route or Vehicle"
     />
     <div id="search-results" class="search-results-dropdown"></div>
   </div>
@@ -322,18 +342,18 @@
   <div id="map"></div>
 
   <!-- Universal Shift History Modal -->
-  <div id="modal-container" class="modal">
+  <div id="modal-container" class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
     <div class="modal-content">
-      <button class="close-btn" onclick="closeModal()">&times;</button>
+      <button class="close-btn" onclick="closeModal()" aria-label="Close modal">&times;</button>
       <div id="modal-title" class="modal-header-title">Shift History</div>
       <div id="modal-body"></div>
     </div>
   </div>
 
   <!-- Route History Modal -->
-  <div id="route-history-modal" class="modal">
+  <div id="route-history-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-route-title">
     <div class="modal-content">
-      <button class="close-btn" onclick="closeRouteHistory()">&times;</button>
+      <button class="close-btn" onclick="closeRouteHistory()" aria-label="Close modal">&times;</button>
       <div id="modal-route-title" class="modal-header-title">Route History</div>
       
       <div class="route-date-selector">
