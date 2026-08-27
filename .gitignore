@@ -3,3 +3,4 @@ bus_history.db
 gtfs-static
 .env
 .gitignore
+bus_history.db-wal
