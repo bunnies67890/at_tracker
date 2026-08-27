@@ -1,0 +1,4 @@
+body { margin: 0; display: flex; font-family: sans-serif; }
+#sidebar { width: 300px; height: 100vh; background: #f4f4f4; padding: 15px; box-sizing: border-box; }
+#map { flex: 1; height: 100vh; }
+input, button { width: 100%; padding: 8px; margin-top: 5px; }
