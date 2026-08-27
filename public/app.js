@@ -289,8 +289,8 @@ async function loadRouteHistoryForSelectedDate() {
       return `
         <div class="departure-row ${isTarget ? 'highlighted-target-trip' : ''}">
           ${isTarget ? '<span class="target-badge">Selected Route Trip</span>' : ''}
-          <div class="departure-main-info">
-            <span>Departure: <strong>${shift.start_time}</strong> | <strong>${formatFleetLabel(shift.vehicle_id)}</strong></span>
+          <div class="departure-main-info" style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
+            <span>Start: <strong>${shift.start_time}</strong> | Fleet: <strong>${formatFleetLabel(shift.vehicle_id)}</strong></span>
             <span><strong>${shift.tardiness}</strong></span>
           </div>
           <div style="font-size: 13px; font-weight: 600; color: #222;">${tripTitle}</div>
@@ -331,7 +331,7 @@ async function toggleShiftCheck(btnEl, vehicleId, targetStartTime, targetRouteDi
 
             return `
               <li style="${isThisRun ? 'color: #d9381e;' : ''}">
-                @ ${h.start_time} - ${h.route_display}${destDisplay} (${h.tardiness})
+                ${h.start_time} - ${h.route_display}${destDisplay} (${h.tardiness})
                 ${isThisRun ? '<span style="color: #d9381e; font-weight: 700; margin-left: 6px;">(this run)</span>' : ''}
               </li>
             `;
