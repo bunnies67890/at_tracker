@@ -11,7 +11,7 @@ const sqlite3 = require('sqlite3').verbose();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-const apiKey = process.env.API_KEY;
+const AT_API_KEY = process.env.AT_API_KEY;
 
 const dbPath = path.join(__dirname, 'bus_history.db');
 const db = new sqlite3.Database(dbPath);
