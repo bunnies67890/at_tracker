@@ -27,14 +27,12 @@ const KNOWN_EXPRESS_ROUTES = new Set([
 ]);
 
 /**
- * Robustly converts any time format (12-hour AM/PM, 24-hour, un-suffixed evening hours, or ISO timestamps)
- * into total minutes from midnight for accurate sorting and filtering.
+ * Robustly converts any time format into total minutes from midnight for accurate sorting
  */
 function parseTimeToMinutes(timeStr) {
   if (!timeStr) return 0;
   let s = String(timeStr).trim();
   
-  // Extract time portion if ISO timestamp or date-time string is present
   if (s.includes('T') || (s.includes(' ') && s.includes('-'))) {
     const parts = s.split(/[\sT]/);
     s = parts[parts.length - 1];
@@ -51,18 +49,14 @@ function parseTimeToMinutes(timeStr) {
     if (ampm === 'PM' && hours < 12) hours += 12;
     if (ampm === 'AM' && hours === 12) hours = 0;
   } else {
-    // If no AM/PM is provided, handle un-suffixed evening hours (e.g. 7, 8, 9, 10, 11 logged without PM)
     if (hours >= 7 && hours <= 11) {
-      hours += 12; // Treat 7:00 - 11:59 without AM/PM as evening PM trips
+      hours += 12;
     }
   }
 
   return hours * 60 + minutes;
 }
 
-/**
- * Parses user input to reliably distinguish Routes from Fleet/Vehicle IDs
- */
 function parseSearchQuery(rawInput) {
   const query = String(rawInput || '').trim().toUpperCase();
   if (!query) return { type: 'empty', query: '' };
@@ -229,20 +223,11 @@ function selectBusFromSearch(vehicleId) {
   }
 }
 
-let activeVehicleHistory = [];
+let allSevenDayShifts = [];
 
 async function openShiftHistory(vehicleId) {
   try {
     const fleetLabel = formatFleetLabel(vehicleId);
-    const res = await fetch(`/api/history/bus/${encodeURIComponent(vehicleId)}`);
-    let history = await res.json();
-
-    if (history && history.length > 0) {
-      history.sort((a, b) => parseTimeToMinutes(b.start_time) - parseTimeToMinutes(a.start_time));
-    }
-    
-    activeVehicleHistory = history || [];
-
     const modalTitle = document.getElementById('modal-title');
     const modalBody = document.getElementById('modal-body');
     const modalContainer = document.getElementById('modal-container');
@@ -250,67 +235,131 @@ async function openShiftHistory(vehicleId) {
     if (modalTitle) modalTitle.innerText = `${fleetLabel} — 7-Day Shift History`;
 
     if (modalBody) {
-      if (!history || history.length === 0) {
-        modalBody.innerHTML = '<p style="color: #666; text-align: center; padding: 20px;">No recorded shift history available for this vehicle in the last 7 days.</p>';
-      } else {
-        modalBody.innerHTML = `
-          <div style="margin-bottom: 12px;">
-            <input type="text" id="vehicle-history-search" placeholder="Filter by route (e.g. 366) or departure time..." 
-              style="width: 100%; padding: 8px 12px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; box-sizing: border-box;"
-              oninput="renderFilteredVehicleHistory()" />
+      modalBody.innerHTML = `
+        <div class="history-controls" style="display: flex; gap: 10px; margin-bottom: 14px; flex-wrap: wrap;">
+          <div style="flex: 1; min-width: 180px;">
+            <label for="shift-history-date-select" style="font-size: 12px; font-weight: 600; display: block; margin-bottom: 4px;">Select Date:</label>
+            <select id="shift-history-date-select" onchange="renderSevenDayShiftHistory()" style="width: 100%; padding: 6px; border-radius: 6px; border: 1px solid #ccc; font-size: 13px;">
+              <!-- Populated dynamically -->
+            </select>
           </div>
-          <div class="shift-timeline" id="vehicle-shift-timeline">
-            ${renderVehicleShiftCards(activeVehicleHistory)}
+          <div style="flex: 2; min-width: 200px;">
+            <label for="shift-history-search" style="font-size: 12px; font-weight: 600; display: block; margin-bottom: 4px;">Search:</label>
+            <input type="text" id="shift-history-search" oninput="renderSevenDayShiftHistory()" placeholder="Filter by route, destination, time..." style="width: 100%; padding: 6px; border-radius: 6px; border: 1px solid #ccc; box-sizing: border-box; font-size: 13px;">
           </div>
-        `;
-      }
+        </div>
+        <div id="seven-day-shifts-list" style="max-height: 400px; overflow-y: auto;">
+          <p style="color: #666; text-align: center; padding: 20px;">Loading shift history...</p>
+        </div>
+      `;
     }
 
     if (modalContainer) modalContainer.style.display = 'block';
+
+    initSevenDayDateDropdown();
+
+    const res = await fetch(`/api/history/bus/${encodeURIComponent(vehicleId)}`);
+    let history = await res.json();
+
+    if (history && history.length > 0) {
+      history.sort((a, b) => parseTimeToMinutes(b.start_time) - parseTimeToMinutes(a.start_time));
+    }
+    
+    allSevenDayShifts = history || [];
+    renderSevenDayShiftHistory();
   } catch (err) {
     console.error('Error opening shift history:', err);
+    const modalBody = document.getElementById('modal-body');
+    if (modalBody) {
+      modalBody.innerHTML = '<p style="color: #d9381e; text-align: center; padding: 20px;">Failed to load shift history for this vehicle.</p>';
+    }
   }
 }
 
-function renderFilteredVehicleHistory() {
-  const timelineEl = document.getElementById('vehicle-shift-timeline');
-  const searchInput = document.getElementById('vehicle-history-search');
-  if (!timelineEl) return;
+function initSevenDayDateDropdown() {
+  const select = document.getElementById('shift-history-date-select');
+  if (!select) return;
 
+  select.innerHTML = '';
+  const today = new Date();
+
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(today);
+    d.setDate(today.getDate() - i);
+    
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    const dateStr = `${year}-${month}-${day}`;
+    
+    const dayName = d.toLocaleDateString('en-NZ', { weekday: 'long' });
+
+    const option = document.createElement('option');
+    option.value = dateStr;
+    option.textContent = `${dateStr} (${dayName})`;
+    select.appendChild(option);
+  }
+}
+
+function renderSevenDayShiftHistory() {
+  const container = document.getElementById('seven-day-shifts-list');
+  if (!container) return;
+
+  const dateSelect = document.getElementById('shift-history-date-select');
+  const selectedDate = dateSelect ? dateSelect.value : '';
+
+  const searchInput = document.getElementById('shift-history-search');
   const query = searchInput ? searchInput.value.toLowerCase().trim() : '';
 
-  const filtered = activeVehicleHistory.filter((shift) => {
-    if (!query) return true;
-    const routeDisplay = String(shift.route_display || '').toLowerCase();
-    const startTime = String(shift.start_time || '').toLowerCase();
-    const tripTitle = formatTripTitle(shift.route_display, shift.origin, shift.destination).toLowerCase();
-    const day = String(shift.day || '').toLowerCase();
+  let selectedDayName = '';
+  if (selectedDate) {
+    try {
+      selectedDayName = new Date(selectedDate + 'T00:00:00').toLocaleDateString('en-NZ', { weekday: 'long' }).toLowerCase();
+    } catch (e) {}
+  }
 
-    return routeDisplay.includes(query) || 
-           startTime.includes(query) || 
-           tripTitle.includes(query) ||
-           day.includes(query);
+  const filtered = allSevenDayShifts.filter((shift) => {
+    const shiftDay = String(shift.day || '').trim();
+    const shiftDate = String(shift.date || shift.trip_date || shift.timestamp || '').split('T')[0];
+    const shiftDayLower = shiftDay.toLowerCase();
+
+    const matchesDate = !selectedDate || 
+      shiftDate === selectedDate || 
+      shiftDay === selectedDate || 
+      shiftDayLower === selectedDate.toLowerCase() ||
+      (selectedDayName && shiftDayLower === selectedDayName);
+
+    if (!matchesDate) return false;
+
+    if (!query) return true;
+    const route = String(shift.route_display || '').toLowerCase();
+    const dest = String(shift.destination || '').toLowerCase();
+    const time = String(shift.start_time || '').toLowerCase();
+    const tardiness = String(shift.tardiness || '').toLowerCase();
+    const tripTitle = formatTripTitle(shift.route_display, shift.origin, shift.destination).toLowerCase();
+
+    return route.includes(query) || dest.includes(query) || time.includes(query) || tardiness.includes(query) || tripTitle.includes(query);
   });
 
   if (filtered.length === 0) {
-    timelineEl.innerHTML = `<p style="color: #666; text-align: center; padding: 20px;">No matching shifts found.</p>`;
+    container.innerHTML = `<p style="color: #666; text-align: center; padding: 20px;">No shifts found for this date.</p>`;
     return;
   }
 
-  timelineEl.innerHTML = renderVehicleShiftCards(filtered);
-}
-
-function renderVehicleShiftCards(shifts) {
-  return shifts.map((shift) => {
+  container.innerHTML = filtered.map((shift) => {
     const tripTitle = formatTripTitle(shift.route_display, shift.origin, shift.destination);
+    const isScheduled = !shift.vehicle_id || String(shift.vehicle_id).toUpperCase() === 'SCHEDULED';
+    const tardinessDisplay = shift.tardiness || (isScheduled ? 'Scheduled' : 'On Time');
+
     return `
-      <div class="shift-card">
-        <div class="shift-card-top">
-          <span class="shift-date-badge">${shift.day}</span>
-          <span class="shift-time">Departure: <strong>${shift.start_time}</strong></span>
+      <div class="departure-row" style="background: #fff; border: 1px solid #e1e4e8; border-radius: 8px; padding: 12px; margin-bottom: 8px;">
+        <div class="departure-main-info" style="display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 4px;">
+          <span>Start: <strong>${shift.start_time || 'N/A'}</strong></span>
+          <span><strong>${tardinessDisplay}</strong></span>
         </div>
-        <div class="shift-title">${tripTitle}</div>
-        <div class="shift-status-pill"><strong>${shift.tardiness}</strong></div>
+        <div style="font-size: 13px; font-weight: 600; color: #222;">
+          ${tripTitle}
+        </div>
       </div>
     `;
   }).join('');
@@ -438,7 +487,6 @@ function renderFilteredRouteDepartures() {
                      String(shift.vehicle_id) === String(targetTripContext.vehicle_id) && 
                      String(shift.start_time) === String(targetTripContext.start_time);
 
-    // Check if this row is a static GTFS placeholder ("Scheduled")
     const isScheduled = String(shift.vehicle_id).toUpperCase() === 'SCHEDULED';
     const fleetDisplay = isScheduled 
       ? `<span style="color: #888; font-style: italic;">Scheduled</span>` 
