@@ -425,15 +425,6 @@ app.get('/api/buses/live', async (req, res) => {
       const delaySec = v.trip?.delay ?? v.delay ?? delaysByTrip[tripId];
       const finalStatus = formatTardiness(delaySec);
 
-      if (routeDisplay !== 'NIS') {
-        db.run(
-          `INSERT INTO shift_history (vehicle_id, trip_id, route_display, origin, destination, day, start_time, tardiness)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(trip_id) DO UPDATE SET tardiness = excluded.tardiness, origin = excluded.origin, destination = excluded.destination`,
-          [vehicleId, tripId, routeDisplay, finalOrigin, finalDest, todayStr, startTimeFormatted, finalStatus]
-        );
-      }
-
       return {
         vehicle_id: vehicleId,
         trip_id: tripId,
@@ -446,9 +437,28 @@ app.get('/api/buses/live', async (req, res) => {
         tardiness: finalStatus,
         occupancy: formatOccupancy(v.occupancy_status)
       };
+    }).filter(Boolean);
+
+    // Optimized bulk database transaction to prevent network volume lag
+    db.serialize(() => {
+      db.run("BEGIN TRANSACTION;");
+      const stmt = db.prepare(`
+        INSERT INTO shift_history (vehicle_id, trip_id, route_display, origin, destination, day, start_time, tardiness)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(trip_id) DO UPDATE SET tardiness = excluded.tardiness, origin = excluded.origin, destination = excluded.destination
+      `);
+
+      liveBuses.forEach((b) => {
+        if (b.route_display !== 'NIS') {
+          stmt.run([b.vehicle_id, b.trip_id, b.route_display, b.origin, b.destination, todayStr, b.start_time, b.tardiness]);
+        }
+      });
+
+      stmt.finalize();
+      db.run("COMMIT;");
     });
 
-    res.json(liveBuses.filter(Boolean));
+    res.json(liveBuses);
   } catch (err) {
     res.status(500).json({ error: 'Server Catch Error', details: err.message });
   }
@@ -629,12 +639,10 @@ app.get('/api/admin/refresh-gtfs', async (req, res) => {
     const dirPath = path.join(__dirname, 'gtfs-static');
     const zipPath = path.join(dirPath, 'gtfs.zip');
 
-    // Delete the old zip if it exists so it's forced to re-download
     if (fs.existsSync(zipPath)) {
       fs.unlinkSync(zipPath);
     }
 
-    // Run the loader again to fetch and re-parse everything
     await loadOrFetchGtfsData();
 
     res.json({ success: true, message: 'GTFS static data successfully refreshed!' });
