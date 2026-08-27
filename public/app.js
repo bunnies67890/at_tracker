@@ -667,7 +667,7 @@ function getCommencedTag(startTimeStr, selectedDateStr) {
   const [y, m, d] = selectedDateStr.split('-').map(Number);
   if (!y || !m || !d) return '';
 
-  const actualDate = new Date(y, m - 1, d - 1);
+  const actualDate = new Date(y, m - 1, d);
   if (isNaN(actualDate.getTime())) return '';
 
   const day = String(actualDate.getDate()).padStart(2, '0');
