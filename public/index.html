@@ -2,13 +2,32 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>AT Bus Tracker</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
-    * { box-sizing: border-box; }
-    body, html { margin: 0; padding: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-    #map { width: 100%; height: 100vh; z-index: 1; }
+    * { 
+      box-sizing: border-box; 
+    }
+    body, html { 
+      margin: 0; 
+      padding: 0; 
+      height: 100%; 
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; 
+    }
+    #map { 
+      width: 100%; 
+      height: 100vh; 
+      z-index: 1; 
+    }
+
+    /* Prevent iOS auto-zoom on focused inputs */
+    input[type="text"],
+    input[type="search"],
+    select,
+    textarea {
+      font-size: 16px !important;
+    }
 
     /* Search Bar Overlay & Dropdown List */
     .search-wrapper {
@@ -17,6 +36,7 @@
       left: 60px;
       z-index: 2000;
       width: 320px;
+      max-width: calc(100vw - 80px);
     }
     .search-input-box {
       width: 100%;
@@ -24,16 +44,18 @@
       border: 1px solid #ccc;
       border-radius: 8px;
       padding: 10px 14px;
-      font-size: 14px;
+      font-size: 16px !important;
       outline: none;
       box-shadow: 0 2px 10px rgba(0,0,0,0.2);
     }
-    .search-input-box:focus { border-color: #0056b3; }
+    .search-input-box:focus { 
+      border-color: #0056b3; 
+    }
 
     .search-results-dropdown {
       display: none;
       position: absolute;
-      top: 45px;
+      top: 48px;
       left: 0;
       right: 0;
       background: #ffffff;
@@ -51,10 +73,22 @@
       justify-content: space-between;
       align-items: center;
     }
-    .search-result-item:last-child { border-bottom: none; }
-    .search-result-item:hover { background: #f4f6f9; }
-    .result-fleet { font-weight: bold; color: #111; font-size: 13px; }
-    .result-trip { font-size: 12px; color: #555; margin-top: 2px; }
+    .search-result-item:last-child { 
+      border-bottom: none; 
+    }
+    .search-result-item:hover { 
+      background: #f4f6f9; 
+    }
+    .result-fleet { 
+      font-weight: bold; 
+      color: #111; 
+      font-size: 14px; 
+    }
+    .result-trip { 
+      font-size: 12px; 
+      color: #555; 
+      margin-top: 2px; 
+    }
     .result-badge {
       background: #0056b3;
       color: #fff;
@@ -64,9 +98,9 @@
       font-weight: bold;
     }
 
-    /* Blue Clickable Route Header Button */
+    /* Blue Clickable Search Header Button */
     .search-route-header {
-      padding: 10px 12px;
+      padding: 12px;
       background: #00467F;
       color: white;
       cursor: pointer;
@@ -77,7 +111,9 @@
       text-align: center;
       transition: background 0.2s;
     }
-    .search-route-header:hover { background: #00335f; }
+    .search-route-header:hover { 
+      background: #00335f; 
+    }
 
     /* Circular Map Markers */
     .bus-marker-badge {
@@ -97,17 +133,28 @@
       line-height: 1;
       cursor: pointer;
     }
-    .bus-marker-badge.nis { background: #6c757d; font-size: 11px; }
+    .bus-marker-badge.nis { 
+      background: #6c757d; 
+      font-size: 11px; 
+    }
 
     /* Popup Styling */
-    .popup-container h3 { margin: 0 0 6px 0; color: #111; font-size: 16px; }
-    .popup-container p { margin: 4px 0; font-size: 13px; color: #333; }
+    .popup-container h3 { 
+      margin: 0 0 6px 0; 
+      color: #111; 
+      font-size: 16px; 
+    }
+    .popup-container p { 
+      margin: 4px 0; 
+      font-size: 13px; 
+      color: #333; 
+    }
     .btn-history {
       margin-top: 10px;
       background: #0056b3;
       color: #fff;
       border: none;
-      padding: 8px 12px;
+      padding: 10px 12px;
       border-radius: 6px;
       cursor: pointer;
       width: 100%;
@@ -115,7 +162,9 @@
       font-size: 13px;
       transition: background 0.2s;
     }
-    .btn-history:hover { background: #004085; }
+    .btn-history:hover { 
+      background: #004085; 
+    }
 
     /* Modals */
     .modal {
@@ -151,7 +200,9 @@
       background: none;
       color: #888;
     }
-    .close-btn:hover { color: #111; }
+    .close-btn:hover { 
+      color: #111; 
+    }
 
     .modal-header-title {
       font-size: 18px;
@@ -162,7 +213,7 @@
       border-bottom: 2px solid #e1e4e8;
     }
 
-    /* Route History Modal Specific Styles */
+    /* Route History Modal Styles */
     .route-date-selector {
       margin-bottom: 16px;
       display: flex;
@@ -176,7 +227,7 @@
       padding: 6px 10px;
       border-radius: 6px;
       border: 1px solid #ccc;
-      font-size: 13px;
+      font-size: 16px !important;
       background: #fff;
       outline: none;
     }
@@ -199,7 +250,7 @@
       position: relative;
     }
 
-    /* Highlighted Target Trip & Badge */
+    /* Highlighted Target Trip */
     .departure-row.highlighted-target-trip {
       background-color: #eef6ff !important;
       border: 2px solid #0066cc !important;
@@ -220,6 +271,7 @@
       display: flex;
       justify-content: space-between;
       align-items: center;
+      width: 100%;
       font-size: 14px;
       color: #222;
     }
@@ -227,7 +279,7 @@
       background: #00B140;
       color: white;
       border: none;
-      padding: 5px 10px;
+      padding: 6px 12px;
       border-radius: 5px;
       cursor: pointer;
       font-size: 12px;
@@ -235,7 +287,9 @@
       align-self: flex-start;
       transition: background 0.2s;
     }
-    .btn-shift-check:hover { background: #009635; }
+    .btn-shift-check:hover { 
+      background: #009635; 
+    }
     .shift-details-box {
       display: none;
       background: #f4f6f8;
@@ -247,7 +301,7 @@
       margin-top: 4px;
     }
 
-    /* Timeline styling for shift history modal */
+    /* Shift History Timeline */
     .shift-timeline {
       display: flex;
       flex-direction: column;
@@ -298,7 +352,15 @@
 
   <!-- Search Overlay -->
   <div class="search-wrapper">
-    <input type="text" id="bus-search" class="search-input-box" placeholder="Search Route, Fleet#, or Dest..." autocomplete="off" />
+    <input 
+      type="text" 
+      id="bus-search" 
+      class="search-input-box" 
+      placeholder="Search Route or Vehicle..." 
+      autocomplete="off" 
+      autocorrect="off"
+      capitalize="off"
+    />
     <div id="search-results" class="search-results-dropdown"></div>
   </div>
 

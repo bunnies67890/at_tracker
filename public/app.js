@@ -21,6 +21,48 @@ if (searchDropdown) {
   L.DomEvent.disableScrollPropagation(searchDropdown);
 }
 
+// Special and express route prefixes that must be treated as ROUTES (not vehicle fleet IDs)
+const KNOWN_EXPRESS_ROUTES = new Set([
+  'NX1', 'NX2', 'WX1', 'CTY', 'TMK', 'AIR', 'INN', 'OUT', 'STH', 'EAST', 'WEST', 'ONE', 'DEV', 'RANG', 'MTIA', 'HOBS', 'GULF', 'HMB', 'PINE', 'MTID', 'BAYS', 'BIRK', 'TIRI', 'F', 'WSTH', 'S-C', 'E-W', 'O-W'
+]);
+
+/**
+ * Converts 12-hour/24-hour time strings (e.g. "4:28 PM", "10:48 PM", "08:15 AM") 
+ * into total minutes from midnight for sorting.
+ */
+function parseTimeToMinutes(timeStr) {
+  if (!timeStr) return 0;
+  const match = String(timeStr).trim().match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?$/i);
+  if (!match) return 0;
+  
+  let hours = parseInt(match[1], 10);
+  const minutes = parseInt(match[2], 10);
+  const ampm = match[3] ? match[3].toUpperCase() : null;
+
+  if (ampm === 'PM' && hours < 12) hours += 12;
+  if (ampm === 'AM' && hours === 12) hours = 0;
+
+  return hours * 60 + minutes;
+}
+
+/**
+ * Parses user input to reliably distinguish Routes from Fleet/Vehicle IDs
+ */
+function parseSearchQuery(rawInput) {
+  const query = String(rawInput || '').trim().toUpperCase();
+  if (!query) return { type: 'empty', query: '' };
+
+  if (KNOWN_EXPRESS_ROUTES.has(query) || /^(NX|WX|AIR|TMK)\d+$/i.test(query)) {
+    return { type: 'route', query };
+  }
+
+  if (/^\d{1,3}[A-Z]?$/i.test(query)) {
+    return { type: 'route', query };
+  }
+
+  return { type: 'vehicle', query };
+}
+
 function formatFleetLabel(vehicleId) {
   if (!vehicleId) return 'Unknown';
   return String(vehicleId).trim();
@@ -30,12 +72,10 @@ function formatCleanDestination(destination) {
   let cleanDest = String(destination || '').trim();
   cleanDest = cleanDest.replace(/^route\s*\w+\s*:?\s*/i, '').trim();
 
-  // If there are multiple parts separated by "to", drop the first part (origin)
   const parts = cleanDest.split(/\s+to\s+/i);
   if (parts.length > 1) {
     cleanDest = parts.slice(1).join(' to ');
   } else {
-    // If it's a one-line destination, strip any leading "to" from GIS feeds
     cleanDest = cleanDest.replace(/^to\s+/i, '').trim();
   }
   return cleanDest;
@@ -107,27 +147,29 @@ function renderAllBusesOnMap() {
   });
 }
 
-// Search Handler without Route prefix
 const searchInputBox = document.getElementById('bus-search');
 if (searchInputBox) {
   searchInputBox.addEventListener('input', handleSearch);
 }
 
 function handleSearch() {
-  const query = (document.getElementById('bus-search')?.value || '').toLowerCase().trim();
+  const rawQuery = (document.getElementById('bus-search')?.value || '').trim();
   const dropdown = document.getElementById('search-results');
 
-  if (!query) {
+  if (!rawQuery) {
     dropdown.style.display = 'none';
     dropdown.innerHTML = '';
     return;
   }
 
+  const parsed = parseSearchQuery(rawQuery);
+  const queryLower = rawQuery.toLowerCase();
   let html = '';
 
-  if (query.length > 0) {
-    const routeQuery = query.toUpperCase();
-    html += `<div class="search-route-header" onclick="openRouteHistoryModal('${routeQuery}')">View Full Route History for ${routeQuery}</div>`;
+  if (parsed.type === 'route') {
+    html += `<div class="search-route-header" onclick="openRouteHistoryModal('${parsed.query}')">View Full Route History for ${parsed.query}</div>`;
+  } else if (parsed.type === 'vehicle') {
+    html += `<div class="search-route-header" onclick="openShiftHistory('${parsed.query}')">View Vehicle History for ${parsed.query}</div>`;
   }
 
   const matches = allBusesData.filter((bus) => {
@@ -137,7 +179,7 @@ function handleSearch() {
     const dest = String(bus.destination || '').toLowerCase();
     const orig = String(bus.origin || '').toLowerCase();
 
-    return fleetLabel.includes(query) || rawId.includes(query) || route.includes(query) || dest.includes(query) || orig.includes(query);
+    return fleetLabel.includes(queryLower) || rawId.includes(queryLower) || route.includes(queryLower) || dest.includes(queryLower) || orig.includes(queryLower);
   }).slice(0, 15);
 
   matches.forEach((bus) => {
@@ -176,7 +218,12 @@ async function openShiftHistory(vehicleId) {
   try {
     const fleetLabel = formatFleetLabel(vehicleId);
     const res = await fetch(`/api/history/bus/${encodeURIComponent(vehicleId)}`);
-    const history = await res.json();
+    let history = await res.json();
+
+    // Sort vehicle shift history from latest to earliest
+    if (history && history.length > 0) {
+      history.sort((a, b) => parseTimeToMinutes(b.start_time) - parseTimeToMinutes(a.start_time));
+    }
 
     const modalTitle = document.getElementById('modal-title');
     const modalBody = document.getElementById('modal-body');
@@ -272,12 +319,15 @@ async function loadRouteHistoryForSelectedDate() {
 
   try {
     const res = await fetch(`/api/history/route/${encodeURIComponent(activeRouteDisplay)}?day=${encodeURIComponent(selectedDate)}`);
-    const shifts = await res.json();
+    let shifts = await res.json();
 
     if (!shifts || shifts.length === 0) {
       departuresList.innerHTML = `<p style="color: #666; text-align: center; padding: 20px;">No recorded history for ${activeRouteDisplay} on ${selectedDate}.</p>`;
       return;
     }
+
+    // Sort route departures from latest start time to earliest
+    shifts.sort((a, b) => parseTimeToMinutes(b.start_time) - parseTimeToMinutes(a.start_time));
 
     departuresList.innerHTML = shifts.map((shift) => {
       const tripTitle = formatTripTitle(shift.route_display, shift.origin, shift.destination);
@@ -289,7 +339,7 @@ async function loadRouteHistoryForSelectedDate() {
       return `
         <div class="departure-row ${isTarget ? 'highlighted-target-trip' : ''}">
           ${isTarget ? '<span class="target-badge">Selected Route Trip</span>' : ''}
-          <div class="departure-main-info" style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
+          <div class="departure-main-info">
             <span>Start: <strong>${shift.start_time}</strong> | Fleet: <strong>${formatFleetLabel(shift.vehicle_id)}</strong></span>
             <span><strong>${shift.tardiness}</strong></span>
           </div>
@@ -315,11 +365,14 @@ async function toggleShiftCheck(btnEl, vehicleId, targetStartTime, targetRouteDi
 
   try {
     const res = await fetch(`/api/history/bus/${encodeURIComponent(vehicleId)}`);
-    const history = await res.json();
+    let history = await res.json();
 
     if (!history || history.length === 0) {
       detailsBox.innerHTML = 'No recent shift details found for this vehicle.';
     } else {
+      // Sort vehicle shift details from latest to earliest
+      history.sort((a, b) => parseTimeToMinutes(b.start_time) - parseTimeToMinutes(a.start_time));
+
       detailsBox.innerHTML = `
         <div style="font-weight: 700; margin-bottom: 6px; color: #111;">This Shift:</div>
         <ul style="margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 5px;">
@@ -340,9 +393,12 @@ async function toggleShiftCheck(btnEl, vehicleId, targetStartTime, targetRouteDi
       `;
     }
     detailsBox.style.display = 'block';
+
+    detailsBox.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   } catch (e) {
     detailsBox.innerHTML = 'Could not load shift details.';
     detailsBox.style.display = 'block';
+    detailsBox.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
 }
 
