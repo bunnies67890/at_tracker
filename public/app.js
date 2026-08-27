@@ -57,6 +57,36 @@ function parseTimeToMinutes(timeStr) {
   return hours * 60 + minutes;
 }
 
+/**
+ * Ensures 24-hour time strings or raw timestamps format properly in 12-hour AM/PM format,
+ * fixing 00:xx showing up as 12 PM.
+ */
+function format12HourTime(timeStr) {
+  if (!timeStr) return 'N/A';
+  let s = String(timeStr).trim();
+
+  // Return directly if already formatted with AM/PM
+  if (/AM|PM/i.test(s)) return s;
+
+  // Extract HH:MM from ISO string or HH:MM:SS format
+  if (s.includes('T') || s.includes(' ')) {
+    const parts = s.split(/[\sT]/);
+    s = parts[parts.length - 1];
+  }
+
+  const match = s.match(/^(\d{1,2}):(\d{2})/);
+  if (!match) return s;
+
+  let hours = parseInt(match[1], 10);
+  const minutes = match[2];
+
+  const period = hours >= 12 ? 'PM' : 'AM';
+  hours = hours % 12;
+  if (hours === 0) hours = 12;
+
+  return `${hours}:${minutes} ${period}`;
+}
+
 function parseSearchQuery(rawInput) {
   const query = String(rawInput || '').trim().toUpperCase();
   if (!query) return { type: 'empty', query: '' };
@@ -97,7 +127,7 @@ function formatTripTitle(routeDisplay, origin, destination) {
   if (cleanDest) {
     return `${routeDisplay} to ${cleanDest}`;
   }
-  return `${routeDisplay}`;
+  return `${routeDisplay} — Scheduled Trip`;
 }
 
 function createBusIcon(routeDisplay) {
@@ -128,12 +158,13 @@ function renderAllBusesOnMap() {
     const fleetLabel = formatFleetLabel(bus.vehicle_id);
     const tripTitle = formatTripTitle(bus.route_display, bus.origin, bus.destination);
     const routeDisplay = bus.route_display || 'NIS';
+    const departureTimeFormatted = format12HourTime(bus.start_time);
 
     const popupContent = `
       <div class="popup-container">
         <h3>${fleetLabel}</h3>
         <p><strong>Trip:</strong> ${tripTitle}</p>
-        <p><strong>Departure Time:</strong> ${bus.start_time || 'N/A'}</p>
+        <p><strong>Departure Time:</strong> ${departureTimeFormatted}</p>
         <p><strong>Status:</strong> ${bus.tardiness}</p>
         <p><strong>Occupancy:</strong> ${bus.occupancy}</p>
         <button class="btn-history" onclick="openShiftHistory('${bus.vehicle_id}')">View Shift History</button>
@@ -334,7 +365,7 @@ function renderSevenDayShiftHistory() {
     if (!query) return true;
     const route = String(shift.route_display || '').toLowerCase();
     const dest = String(shift.destination || '').toLowerCase();
-    const time = String(shift.start_time || '').toLowerCase();
+    const time = format12HourTime(shift.start_time).toLowerCase();
     const tardiness = String(shift.tardiness || '').toLowerCase();
     const tripTitle = formatTripTitle(shift.route_display, shift.origin, shift.destination).toLowerCase();
 
@@ -350,11 +381,12 @@ function renderSevenDayShiftHistory() {
     const tripTitle = formatTripTitle(shift.route_display, shift.origin, shift.destination);
     const isScheduled = !shift.vehicle_id || String(shift.vehicle_id).toUpperCase() === 'SCHEDULED';
     const tardinessDisplay = shift.tardiness || (isScheduled ? 'Scheduled' : 'On Time');
+    const timeDisplay = format12HourTime(shift.start_time);
 
     return `
       <div class="departure-row" style="background: #fff; border: 1px solid #e1e4e8; border-radius: 8px; padding: 12px; margin-bottom: 8px;">
         <div class="departure-main-info" style="display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 4px;">
-          <span>Start: <strong>${shift.start_time || 'N/A'}</strong></span>
+          <span>Start: <strong>${timeDisplay}</strong></span>
           <span><strong>${tardinessDisplay}</strong></span>
         </div>
         <div style="font-size: 13px; font-weight: 600; color: #222;">
@@ -382,15 +414,19 @@ async function openRouteHistoryModal(routeDisplay, specificTrip = null) {
   const dateSelect = document.getElementById('route-date-select');
   try {
     const res = await fetch(`/api/history/route-days/${encodeURIComponent(routeDisplay)}`);
-    const days = await res.json();
+    let days = await res.json();
+
+    const todayStr = new Date().toISOString().split('T')[0];
+
+    // Ensure today's date is ALWAYS injected as an option after midnight
+    if (!days || days.length === 0) {
+      days = [todayStr];
+    } else if (!days.includes(todayStr)) {
+      days.unshift(todayStr);
+    }
 
     if (dateSelect) {
-      if (!days || days.length === 0) {
-        const today = new Date().toISOString().split('T')[0];
-        dateSelect.innerHTML = `<option value="${today}">${today}</option>`;
-      } else {
-        dateSelect.innerHTML = days.map(d => `<option value="${d}">${d}</option>`).join('');
-      }
+      dateSelect.innerHTML = days.map(d => `<option value="${d}">${d}</option>`).join('');
     }
 
     const routeModal = document.getElementById('route-history-modal');
@@ -462,7 +498,7 @@ function renderFilteredRouteDepartures() {
 
   const filtered = activeRouteShifts.filter((shift) => {
     if (!query) return true;
-    const startTime = String(shift.start_time || '').toLowerCase();
+    const startTime = format12HourTime(shift.start_time).toLowerCase();
     const fleet = formatFleetLabel(shift.vehicle_id).toLowerCase();
     const route = String(shift.route_display || '').toLowerCase();
     const dest = formatCleanDestination(shift.destination).toLowerCase();
@@ -482,6 +518,7 @@ function renderFilteredRouteDepartures() {
 
   departuresList.innerHTML = filtered.map((shift) => {
     const tripTitle = formatTripTitle(shift.route_display, shift.origin, shift.destination);
+    const formattedStartTime = format12HourTime(shift.start_time);
     
     const isTarget = targetTripContext && 
                      String(shift.vehicle_id) === String(targetTripContext.vehicle_id) && 
@@ -496,7 +533,7 @@ function renderFilteredRouteDepartures() {
       <div class="departure-row ${isTarget ? 'highlighted-target-trip' : ''}">
         ${isTarget ? '<span class="target-badge">Selected Route Trip</span>' : ''}
         <div class="departure-main-info">
-          <span>Start: <strong>${shift.start_time}</strong> | Fleet: ${fleetDisplay}</span>
+          <span>Start: <strong>${formattedStartTime}</strong> | Fleet: ${fleetDisplay}</span>
           <span><strong>${shift.tardiness}</strong></span>
         </div>
         <div style="font-size: 13px; font-weight: 600; color: #222;">${tripTitle}</div>
@@ -554,13 +591,14 @@ async function toggleShiftCheck(btnEl, vehicleId, targetStartTime, targetRouteDi
 function renderShiftListItems(history, targetStartTime, targetRouteDisplay) {
   return history.map(h => {
     const isThisRun = (String(h.start_time) === String(targetStartTime) && String(h.route_display) === String(targetRouteDisplay));
+    const formattedTime = format12HourTime(h.start_time);
     
     let destText = formatCleanDestination(h.destination);
     let destDisplay = destText ? ` to <strong>${destText}</strong>` : '';
 
     return `
       <li style="${isThisRun ? 'color: #d9381e;' : ''}">
-        ${h.start_time} - ${h.route_display}${destDisplay} (${h.tardiness})
+        ${formattedTime} - ${h.route_display}${destDisplay} (${h.tardiness})
         ${isThisRun ? '<span style="color: #d9381e; font-weight: 700; margin-left: 6px;">(this run)</span>' : ''}
       </li>
     `;
@@ -577,7 +615,7 @@ function filterShiftDetails(inputEl) {
 
   const filtered = row._vehicleHistory.filter(h => {
     if (!query) return true;
-    const startTime = String(h.start_time || '').toLowerCase();
+    const startTime = format12HourTime(h.start_time).toLowerCase();
     const route = String(h.route_display || '').toLowerCase();
     const dest = formatCleanDestination(h.destination).toLowerCase();
     const tardiness = String(h.tardiness || '').toLowerCase();
