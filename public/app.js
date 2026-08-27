@@ -27,7 +27,8 @@ const KNOWN_EXPRESS_ROUTES = new Set([
 ]);
 
 /**
- * Robustly converts any time format into total minutes from midnight for accurate sorting
+ * Standard 24-hour time conversion into minutes from 00:00 (Midnight) to 23:59 (11:59 PM).
+ * 12:00 AM parses strictly to 0 minutes.
  */
 function parseTimeToMinutes(timeStr) {
   if (!timeStr) return 0;
@@ -48,27 +49,41 @@ function parseTimeToMinutes(timeStr) {
   if (ampm) {
     if (ampm === 'PM' && hours < 12) hours += 12;
     if (ampm === 'AM' && hours === 12) hours = 0;
-  } else {
-    if (hours >= 7 && hours <= 11) {
-      hours += 12;
-    }
   }
 
   return hours * 60 + minutes;
 }
 
 /**
- * Ensures 24-hour time strings or raw timestamps format properly in 12-hour AM/PM format,
- * fixing 00:xx showing up as 12 PM.
+ * Converts ISO timestamps or raw dates into local YYYY-MM-DD strings
+ * using local system time to prevent UTC day shifts.
+ */
+function getShiftLocalDate(shift) {
+  const rawDate = shift.date || shift.trip_date || shift.timestamp || '';
+  if (!rawDate) return '';
+  const str = String(rawDate).trim();
+  
+  if (str.includes('T') || str.includes('Z')) {
+    const d = new Date(str);
+    if (!isNaN(d.getTime())) {
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, '0');
+      const day = String(d.getDate()).padStart(2, '0');
+      return `${y}-${m}-${day}`;
+    }
+  }
+  return str.split('T')[0];
+}
+
+/**
+ * Ensures 24-hour time strings or raw timestamps format properly in 12-hour AM/PM format.
  */
 function format12HourTime(timeStr) {
   if (!timeStr) return 'N/A';
   let s = String(timeStr).trim();
 
-  // Return directly if already formatted with AM/PM
   if (/AM|PM/i.test(s)) return s;
 
-  // Extract HH:MM from ISO string or HH:MM:SS format
   if (s.includes('T') || s.includes(' ')) {
     const parts = s.split(/[\sT]/);
     s = parts[parts.length - 1];
@@ -271,7 +286,6 @@ async function openShiftHistory(vehicleId) {
           <div style="flex: 1; min-width: 180px;">
             <label for="shift-history-date-select" style="font-size: 12px; font-weight: 600; display: block; margin-bottom: 4px;">Select Date:</label>
             <select id="shift-history-date-select" onchange="renderSevenDayShiftHistory()" style="width: 100%; padding: 6px; border-radius: 6px; border: 1px solid #ccc; font-size: 13px;">
-              <!-- Populated dynamically -->
             </select>
           </div>
           <div style="flex: 2; min-width: 200px;">
@@ -351,8 +365,14 @@ function renderSevenDayShiftHistory() {
 
   const filtered = allSevenDayShifts.filter((shift) => {
     const shiftDay = String(shift.day || '').trim();
-    const shiftDate = String(shift.date || shift.trip_date || shift.timestamp || '').split('T')[0];
+    const shiftDate = getShiftLocalDate(shift);
     const shiftDayLower = shiftDay.toLowerCase();
+
+    // STRICT DATE MATCHING: Exclude shifts that belong to a different calendar date
+    if (selectedDate && shiftDate && shiftDate !== selectedDate && shiftDate !== '') {
+      // Allow fallback matching only if shiftDate is empty, otherwise enforce strict match
+      if (shiftDate !== selectedDate) return false;
+    }
 
     const matchesDate = !selectedDate || 
       shiftDate === selectedDate || 
@@ -380,7 +400,7 @@ function renderSevenDayShiftHistory() {
   container.innerHTML = filtered.map((shift) => {
     const tripTitle = formatTripTitle(shift.route_display, shift.origin, shift.destination);
     const isScheduled = !shift.vehicle_id || String(shift.vehicle_id).toUpperCase() === 'SCHEDULED';
-    const tardinessDisplay = shift.tardiness || (isScheduled ? 'Scheduled' : 'On Time');
+    const tardinessDisplay = isScheduled ? 'Scheduled' : (shift.tardiness || 'On Time');
     const timeDisplay = format12HourTime(shift.start_time);
 
     return `
@@ -416,9 +436,9 @@ async function openRouteHistoryModal(routeDisplay, specificTrip = null) {
     const res = await fetch(`/api/history/route-days/${encodeURIComponent(routeDisplay)}`);
     let days = await res.json();
 
-    const todayStr = new Date().toISOString().split('T')[0];
+    const now = new Date();
+    const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 
-    // Ensure today's date is ALWAYS injected as an option after midnight
     if (!days || days.length === 0) {
       days = [todayStr];
     } else if (!days.includes(todayStr)) {
@@ -449,7 +469,9 @@ function getDayOfWeekName(dateStr) {
 
 async function loadRouteHistoryForSelectedDate() {
   const dateSelect = document.getElementById('route-date-select');
-  const selectedDate = dateSelect ? dateSelect.value : new Date().toISOString().split('T')[0];
+  const now = new Date();
+  const defaultToday = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const selectedDate = dateSelect ? dateSelect.value : defaultToday;
   
   const dayOfWeek = getDayOfWeekName(selectedDate);
   const dayNameEl = document.getElementById('selected-day-name');
@@ -493,22 +515,32 @@ function renderFilteredRouteDepartures() {
   const departuresList = document.getElementById('route-departures-list');
   if (!departuresList) return;
 
+  const dateSelect = document.getElementById('route-date-select');
+  const now = new Date();
+  const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const selectedDate = dateSelect ? dateSelect.value : todayStr;
+  const currentMinutes = now.getHours() * 60 + now.getMinutes();
+
   const searchInput = document.getElementById('route-departure-search');
   const query = searchInput ? searchInput.value.toLowerCase().trim() : '';
 
   const filtered = activeRouteShifts.filter((shift) => {
+    // STRICT CALENDAR DATE MATCHING: Completely excludes trips belonging to other dates (prevents 12:00 AM bleeding into previous days)
+    const shiftDate = getShiftLocalDate(shift);
+    if (selectedDate && shiftDate && shiftDate !== selectedDate) {
+      return false;
+    }
+
     if (!query) return true;
     const startTime = format12HourTime(shift.start_time).toLowerCase();
     const fleet = formatFleetLabel(shift.vehicle_id).toLowerCase();
     const route = String(shift.route_display || '').toLowerCase();
     const dest = formatCleanDestination(shift.destination).toLowerCase();
-    const tardiness = String(shift.tardiness || '').toLowerCase();
 
     return startTime.includes(query) || 
            fleet.includes(query) || 
            route.includes(query) || 
-           dest.includes(query) || 
-           tardiness.includes(query);
+           dest.includes(query);
   });
 
   if (filtered.length === 0) {
@@ -519,22 +551,28 @@ function renderFilteredRouteDepartures() {
   departuresList.innerHTML = filtered.map((shift) => {
     const tripTitle = formatTripTitle(shift.route_display, shift.origin, shift.destination);
     const formattedStartTime = format12HourTime(shift.start_time);
+    const shiftMinutes = parseTimeToMinutes(shift.start_time);
     
     const isTarget = targetTripContext && 
                      String(shift.vehicle_id) === String(targetTripContext.vehicle_id) && 
                      String(shift.start_time) === String(targetTripContext.start_time);
 
-    const isScheduled = String(shift.vehicle_id).toUpperCase() === 'SCHEDULED';
+    const isScheduled = !shift.vehicle_id || String(shift.vehicle_id).toUpperCase() === 'SCHEDULED';
     const fleetDisplay = isScheduled 
       ? `<span style="color: #888; font-style: italic;">Scheduled</span>` 
       : `<strong>${formatFleetLabel(shift.vehicle_id)}</strong>`;
+
+    let tardinessDisplay = shift.tardiness || 'Scheduled';
+    if (isScheduled || selectedDate > todayStr || (selectedDate === todayStr && shiftMinutes > currentMinutes)) {
+      tardinessDisplay = 'Scheduled';
+    }
 
     return `
       <div class="departure-row ${isTarget ? 'highlighted-target-trip' : ''}">
         ${isTarget ? '<span class="target-badge">Selected Route Trip</span>' : ''}
         <div class="departure-main-info">
           <span>Start: <strong>${formattedStartTime}</strong> | Fleet: ${fleetDisplay}</span>
-          <span><strong>${shift.tardiness}</strong></span>
+          <span><strong>${tardinessDisplay}</strong></span>
         </div>
         <div style="font-size: 13px; font-weight: 600; color: #222;">${tripTitle}</div>
         ${isScheduled ? '' : `<button class="btn-shift-check" onclick="toggleShiftCheck(this, '${shift.vehicle_id}', '${shift.start_time}', '${shift.route_display}')">Check Shift</button>`}

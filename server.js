@@ -22,7 +22,19 @@ const db = new sqlite3.Database(dbPath, (err) => {
   if (err) console.error('Database connection error:', err.message);
 });
 
-// Optimized with WAL mode and NORMAL sync for Railway network volumes
+// Helper: Standardize local date in Pacific/Auckland timezone (YYYY-MM-DD)
+function getNZDateStr(date = new Date()) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Pacific/Auckland' }).format(date);
+}
+
+function getPreviousDateStr(dateStr) {
+  if (!dateStr) return dateStr;
+  const parts = dateStr.split('-').map(Number);
+  if (parts.length !== 3) return dateStr;
+  const d = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2] - 1));
+  return d.toISOString().split('T')[0];
+}
+
 db.serialize(() => {
   db.run("PRAGMA journal_mode = WAL;");
   db.run("PRAGMA synchronous = NORMAL;");
@@ -46,7 +58,8 @@ db.serialize(() => {
 });
 
 function purgeOldHistory() {
-  db.run(`DELETE FROM shift_history WHERE day < date('now', '-7 days')`, (err) => {
+  const cutoffDate = getNZDateStr(new Date(Date.now() - 7 * 24 * 60 * 60 * 1000));
+  db.run(`DELETE FROM shift_history WHERE day < ?`, [cutoffDate], (err) => {
     if (err) console.error('[DB] Error purging old history:', err.message);
   });
 }
@@ -62,6 +75,7 @@ let tripToBlockMap = {};
 let blockToTripsMap = {};
 let tripStartTimeMap = {};
 let tripServiceMap = {};
+let tripIsOvernightMap = {};
 let calendarServices = {}; 
 let calendarExceptions = {}; 
 let routeDisplayToTripsMap = {};
@@ -93,6 +107,7 @@ function formatTripTime(timeStr) {
   if (parts.length >= 2) {
     let hour = parseInt(parts[0], 10);
     const min = parts[1].padStart(2, '0');
+    hour = hour % 24;
     const ampm = hour >= 12 ? 'PM' : 'AM';
     hour = hour % 12 || 12;
     return `${hour}:${min} ${ampm}`;
@@ -102,9 +117,10 @@ function formatTripTime(timeStr) {
 
 function timeStrToSeconds(timeStr) {
   if (!timeStr) return 0;
-  const parts = timeStr.split(':');
+  const parts = String(timeStr).split(':');
   if (parts.length < 2) return 0;
-  return parseInt(parts[0], 10) * 3600 + parseInt(parts[1], 10) * 60 + parseInt(parts[2] || 0, 10);
+  const hours = parseInt(parts[0], 10) % 24;
+  return hours * 3600 + parseInt(parts[1], 10) * 60 + parseInt(parts[2] || 0, 10);
 }
 
 function timeStrToMinutes(timeStr) {
@@ -123,15 +139,19 @@ function timeStrToMinutes(timeStr) {
     if (ampm === 'PM' && hours < 12) hours += 12;
     if (ampm === 'AM' && hours === 12) hours = 0;
   } else {
-    if (hours >= 7 && hours <= 11) hours += 12;
+    hours = hours % 24;
   }
   return hours * 60 + minutes;
 }
 
 function isServiceActiveOnDate(serviceId, dateStr) {
+  if (!serviceId) return true;
   const cleanDate = dateStr.replace(/-/g, '');
-  const d = new Date(dateStr + 'T00:00:00');
-  const dayOfWeek = d.getDay(); 
+  const parts = dateStr.split('-').map(Number);
+  if (parts.length !== 3) return true;
+
+  const d = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2]));
+  const dayOfWeek = d.getUTCDay(); 
   const dayKeys = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
   const dayKey = dayKeys[dayOfWeek];
 
@@ -140,13 +160,10 @@ function isServiceActiveOnDate(serviceId, dateStr) {
   }
 
   const cal = calendarServices[serviceId];
-  if (!cal) return true; // Fallback: if service not in calendar, assume active
+  if (!cal) return true;
 
-  // If GTFS static calendar range is outdated, honor the day-of-week anyway
   const inRange = (cleanDate >= cal.start_date && cleanDate <= cal.end_date);
-  if (!inRange) {
-    return cal[dayKey] === '1';
-  }
+  if (!inRange) return false;
 
   return cal[dayKey] === '1';
 }
@@ -180,6 +197,7 @@ async function loadOrFetchGtfsData() {
       allStops = [];
       stopNamesMap = {};
       routeDisplayToTripsMap = {};
+      tripIsOvernightMap = {};
 
       const stopsEntry = zip.getEntry('stops.txt');
       if (stopsEntry) {
@@ -293,6 +311,14 @@ async function loadOrFetchGtfsData() {
           const depTime = st.departure_time?.trim();
           const sId = st.stop_id?.trim();
 
+          if (tId && depTime) {
+            const hour = parseInt(depTime.split(':')[0], 10);
+            if (!isNaN(hour) && hour >= 24) {
+              tripIsOvernightMap[tId] = true;
+              tripIsOvernightMap[extractBaseTripId(tId)] = true;
+            }
+          }
+
           if (tId && !isNaN(seq)) {
             if (depTime && (!tripMinSeqTime[tId] || seq < tripMinSeqTime[tId].seq)) {
               tripMinSeqTime[tId] = { seq, time: depTime };
@@ -346,7 +372,6 @@ async function loadOrFetchGtfsData() {
         }
       }
 
-      // Populate routeDisplayToTripsMap with normalized uppercase keys
       for (const tId in tripMetaMap) {
         const meta = tripMetaMap[tId];
         const rDisp = meta.route;
@@ -359,6 +384,7 @@ async function loadOrFetchGtfsData() {
         const orig = tripOriginMap[tId] || '';
         const dest = meta.destination || tripDestinationMap[tId] || `Route ${rDisp}`;
         const serviceId = meta.service_id;
+        const isOvernight = !!tripIsOvernightMap[tId];
 
         routeDisplayToTripsMap[upperRDisp].push({
           trip_id: tId,
@@ -366,7 +392,8 @@ async function loadOrFetchGtfsData() {
           service_id: serviceId,
           origin: orig,
           destination: dest,
-          start_time: startTime
+          start_time: startTime,
+          is_overnight: isOvernight
         });
       }
     } catch (e) {
@@ -442,9 +469,9 @@ function getActualTripStartTime(v, timestampSec) {
   if (match) return formatTripTime(`${match[1]}:${match[2]}:${match[3]}`);
   if (timestampSec) {
     const d = new Date(timestampSec * 1000);
-    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return d.toLocaleTimeString('en-NZ', { timeZone: 'Pacific/Auckland', hour: '2-digit', minute: '2-digit' });
   }
-  return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return new Date().toLocaleTimeString('en-NZ', { timeZone: 'Pacific/Auckland', hour: '2-digit', minute: '2-digit' });
 }
 
 app.get('/api/buses/live', async (req, res) => {
@@ -456,8 +483,7 @@ app.get('/api/buses/live', async (req, res) => {
 
     const data = await response.json();
     const entities = data.response?.entity || data.entity || [];
-    const now = new Date();
-    const todayStr = now.toISOString().split('T')[0];
+    const todayStr = getNZDateStr();
 
     const liveBuses = entities.map((e) => {
       const v = e.vehicle;
@@ -525,7 +551,7 @@ app.get('/api/stops/:id/departures', (req, res) => {
 
   const nowAkl = new Date(new Date().toLocaleString("en-US", { timeZone: "Pacific/Auckland" }));
   const currentSeconds = nowAkl.getHours() * 3600 + nowAkl.getMinutes() * 60 + nowAkl.getSeconds();
-  const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Pacific/Auckland' }).format(new Date());
+  const todayStr = getNZDateStr();
 
   const seenKeys = new Set();
   const upcoming = [];
@@ -573,7 +599,10 @@ app.get('/api/history/bus/:vehicleId', (req, res) => {
 
 app.get('/api/history/vehicle-day/:vehicleId', (req, res) => {
   const vehicleId = req.params.vehicleId.trim().toUpperCase();
-  const day = req.query.day || new Date().toISOString().split('T')[0];
+  const todayStr = getNZDateStr();
+  const day = req.query.day || todayStr;
+  const prevDay = getPreviousDateStr(day);
+  const isToday = (day === todayStr);
 
   db.all(
     `SELECT route_display, origin, destination, day, start_time, tardiness, trip_id 
@@ -599,7 +628,12 @@ app.get('/api/history/vehicle-day/:vehicleId', (req, res) => {
       blockIdsToFetch.forEach(bId => {
         const scheduledTrips = blockToTripsMap[bId] || [];
         scheduledTrips.forEach(st => {
-          if (isServiceActiveOnDate(st.service_id, day)) {
+          const isOvernight = !!tripIsOvernightMap[st.trip_id];
+          const serviceActive = isOvernight 
+            ? isServiceActiveOnDate(st.service_id, prevDay)
+            : isServiceActiveOnDate(st.service_id, day);
+
+          if (serviceActive) {
             if (!seenTripIds.has(st.trip_id)) {
               seenTripIds.add(st.trip_id);
               const rDisp = routeIdToShortNameMap[st.route_id] || routeIdToShortNameMap[st.route_id?.split('-')[0]] || parseRouteDisplay(st.route_id);
@@ -607,7 +641,7 @@ app.get('/api/history/vehicle-day/:vehicleId', (req, res) => {
               const orig = tripOriginMap[st.trip_id] || tripOriginMap[extractBaseTripId(st.trip_id)] || '';
               const dest = st.headsign || tripDestinationMap[st.trip_id] || `Route ${rDisp}`;
               
-              const delaySec = delaysByTrip[st.trip_id];
+              const delaySec = isToday ? delaysByTrip[st.trip_id] : undefined;
               const tardiness = formatTardiness(delaySec);
 
               blockExpandedRows.push({
@@ -638,7 +672,7 @@ app.get('/api/history/vehicle-day/:vehicleId', (req, res) => {
       });
 
       let finalRows = Array.from(uniqueMap.values());
-      finalRows.sort((a, b) => (a.start_time || '').localeCompare(b.start_time || ''));
+      finalRows.sort((a, b) => timeStrToMinutes(a.start_time) - timeStrToMinutes(b.start_time));
 
       const cleaned = finalRows.map(r => ({
         route_display: r.route_display,
@@ -659,7 +693,10 @@ app.get('/api/history/route/:routeDisplay', (req, res) => {
   const rawRoute = req.params.routeDisplay || '';
   const routeDisplay = rawRoute.trim().toUpperCase();
   const altRouteDisplay = routeDisplay.replace(/^0+/, '');
-  const day = req.query.day || new Date().toISOString().split('T')[0];
+  const todayStr = getNZDateStr();
+  const day = req.query.day || todayStr;
+  const prevDay = getPreviousDateStr(day);
+  const isToday = (day === todayStr);
 
   db.all(
     `SELECT vehicle_id, trip_id, route_display, origin, destination, day, start_time, tardiness, created_at 
@@ -672,17 +709,20 @@ app.get('/api/history/route/:routeDisplay', (req, res) => {
       const seenTripIds = new Set(rows.map(r => r.trip_id).filter(Boolean));
       let combinedRows = [...rows];
 
-      // Merge with scheduled GTFS static route trips with flexible key lookups
       const staticTrips = routeDisplayToTripsMap[routeDisplay] || routeDisplayToTripsMap[altRouteDisplay] || [];
       
       staticTrips.forEach(st => {
-        if (isServiceActiveOnDate(st.service_id, day)) {
+        const serviceActive = st.is_overnight 
+          ? isServiceActiveOnDate(st.service_id, prevDay)
+          : isServiceActiveOnDate(st.service_id, day);
+
+        if (serviceActive) {
           const tId = st.trip_id;
           const baseId = extractBaseTripId(tId);
           if (!seenTripIds.has(tId) && !seenTripIds.has(baseId)) {
             seenTripIds.add(tId);
 
-            const delaySec = delaysByTrip[tId] || delaysByTrip[baseId];
+            const delaySec = isToday ? (delaysByTrip[tId] ?? delaysByTrip[baseId]) : undefined;
             const tardiness = formatTardiness(delaySec);
 
             combinedRows.push({
@@ -700,7 +740,6 @@ app.get('/api/history/route/:routeDisplay', (req, res) => {
         }
       });
 
-      // Deduplicate and prioritize live logged data over scheduled placeholders
       const uniqueMap = new Map();
       combinedRows.forEach(r => {
         const key = `${r.start_time}_${r.origin}_${r.destination}`;
@@ -723,15 +762,27 @@ app.get('/api/history/route/:routeDisplay', (req, res) => {
 });
 
 app.get('/api/history/route-days/:routeDisplay', (req, res) => {
-  const routeDisplay = req.params.routeDisplay;
+  const rawRoute = req.params.routeDisplay || '';
+  const routeDisplay = rawRoute.trim().toUpperCase();
+  const altRouteDisplay = routeDisplay.replace(/^0+/, '');
+
   db.all(
     `SELECT DISTINCT day FROM shift_history 
-     WHERE route_display = ? AND day >= date('now', '-7 days') 
+     WHERE (route_display = ? OR route_display = ?)
      ORDER BY day DESC`,
-    [routeDisplay],
+    [routeDisplay, altRouteDisplay],
     (err, rows) => {
-      if (err) return res.status(500).json([]);
-      res.json(rows.map(r => r.day) || []);
+      const daysSet = new Set((rows || []).map(r => r.day));
+
+      const nowAkl = new Date(new Date().toLocaleString("en-US", { timeZone: "Pacific/Auckland" }));
+      for (let i = 0; i < 7; i++) {
+        const d = new Date(nowAkl);
+        d.setDate(d.getDate() - i);
+        daysSet.add(getNZDateStr(d));
+      }
+
+      const sortedDays = Array.from(daysSet).sort().reverse();
+      res.json(sortedDays);
     }
   );
 });
