@@ -624,6 +624,25 @@ app.get('/api/history/route-days/:routeDisplay', (req, res) => {
   );
 });
 
+app.get('/api/admin/refresh-gtfs', async (req, res) => {
+  try {
+    const dirPath = path.join(__dirname, 'gtfs-static');
+    const zipPath = path.join(dirPath, 'gtfs.zip');
+
+    // Delete the old zip if it exists so it's forced to re-download
+    if (fs.existsSync(zipPath)) {
+      fs.unlinkSync(zipPath);
+    }
+
+    // Run the loader again to fetch and re-parse everything
+    await loadOrFetchGtfsData();
+
+    res.json({ success: true, message: 'GTFS static data successfully refreshed!' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 
 const server = app.listen(PORT, () => {
