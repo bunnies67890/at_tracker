@@ -376,7 +376,7 @@ async function toggleShiftCheck(btnEl, vehicleId, targetStartTime, targetRouteDi
       detailsBox.innerHTML = `
         <div style="font-weight: 700; margin-bottom: 6px; color: #111;">This Shift:</div>
         <ul style="margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 5px;">
-          ${history.slice(0, 5).map(h => {
+          ${history.map(h => {
             const isThisRun = (String(h.start_time) === String(targetStartTime) && String(h.route_display) === String(targetRouteDisplay));
             
             let destText = formatCleanDestination(h.destination);
