@@ -14,7 +14,10 @@ app.use(express.static(path.join(__dirname, 'public')));
 const AT_API_KEY = process.env.AT_API_KEY;
 console.log('DEBUG CHECK:', AT_API_KEY ? `Key exists (${AT_API_KEY.length} chars)` : 'KEY IS BLANK OR UNDEFINED');
 
-const dbPath = path.join(__dirname, 'bus_history.db');
+const dbPath = process.env.RAILWAY_VOLUME_MOUNT_PATH 
+  ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'bus_history.db') 
+  : path.join(__dirname, 'bus_history.db');
+
 const db = new sqlite3.Database(dbPath);
 
 db.serialize(() => {
