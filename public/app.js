@@ -60,14 +60,11 @@ function escapeHtml(str) {
 }
 
 /**
- * Helper: Normalizes a date into YYYY-MM-DD string.
+ * Helper: Normalizes a date into YYYY-MM-DD string using Auckland local time.
  */
 function toDateStr(dateObj) {
   if (!(dateObj instanceof Date) || isNaN(dateObj.getTime())) return '';
-  const y = dateObj.getFullYear();
-  const m = String(dateObj.getMonth() + 1).padStart(2, '0');
-  const d = String(dateObj.getDate()).padStart(2, '0');
-  return `${y}-${m}-${d}`;
+  return dateObj.toLocaleDateString('en-CA', { timeZone: 'Pacific/Auckland' });
 }
 
 /**
@@ -125,7 +122,6 @@ function format12HourTime(rawTime) {
     s = s.split('T')[1];
   }
 
-  // Guard added to ensure we don't sever AM/PM format strings like "12:00 AM"
   if (s.includes(' ') && s.includes('-')) {
     const parts = s.split(/\s+/);
     s = parts[parts.length - 1];
@@ -165,7 +161,7 @@ function isEarlyMorningTrip(timeStr) {
 function getShiftLocalDate(shift) {
   if (!shift || typeof shift !== 'object') return '';
 
-  const rawDate = shift.day || // Added direct support for SQL 'day' column
+  const rawDate = shift.day || 
                   shift.date || 
                   shift.service_date || 
                   shift.timestamp || 
@@ -209,9 +205,7 @@ function processShiftTrips(shiftTrips, selectedDateStr) {
   return shiftTrips
     .filter(trip => {
       const tripDate = getShiftLocalDate(trip);
-      if (!tripDate) return true; // Safe fallback if server didn't embed date attribute
-
-      // Exact match on physical date
+      if (!tripDate) return true;
       return tripDate === selectedDateStr;
     })
     .map(trip => {
@@ -479,14 +473,14 @@ function initSevenDayDateDropdown() {
   if (!select) return;
 
   select.innerHTML = '';
-  const today = new Date();
+  const now = new Date();
 
   for (let i = 0; i < 7; i++) {
-    const d = new Date(today);
-    d.setDate(today.getDate() - i);
+    const d = new Date(now);
+    d.setDate(now.getDate() - i);
     
     const dateStr = toDateStr(d);
-    const dayName = d.toLocaleDateString('en-NZ', { weekday: 'long' });
+    const dayName = d.toLocaleDateString('en-NZ', { timeZone: 'Pacific/Auckland', weekday: 'long' });
 
     const option = document.createElement('option');
     option.value = dateStr;
@@ -572,14 +566,16 @@ async function openRouteHistoryModal(routeDisplay, specificTrip = null) {
     const now = new Date();
     const todayStr = toDateStr(now);
 
-    if (days.length === 0) {
-      days = [todayStr];
-    } else if (!days.includes(todayStr)) {
+    // Filter out future dates (e.g., Saturday) so the dropdown starts at today
+    days = days.filter(d => d <= todayStr);
+
+    if (!days.includes(todayStr)) {
       days.unshift(todayStr);
     }
 
     if (dateSelect) {
       dateSelect.innerHTML = days.map(d => `<option value="${escapeHtml(d)}">${escapeHtml(d)}</option>`).join('');
+      dateSelect.value = todayStr; // Guarantees today is explicitly selected
     }
 
     const routeModal = document.getElementById('route-history-modal');
@@ -595,7 +591,7 @@ function getDayOfWeekName(dateStr) {
   try {
     const d = new Date(dateStr + 'T00:00:00');
     if (isNaN(d.getTime())) return '';
-    return d.toLocaleDateString('en-US', { weekday: 'long' });
+    return d.toLocaleDateString('en-US', { timeZone: 'Pacific/Auckland', weekday: 'long' });
   } catch (e) {
     return '';
   }
@@ -691,8 +687,15 @@ function renderFilteredRouteDepartures() {
   const query = searchInput ? searchInput.value.toLowerCase().trim() : '';
 
   const filtered = activeRouteShifts.filter((shift) => {
-    if (!query) return true;
     const startTime = getTripStartTime(shift);
+    const shiftMinutes = parseTimeToMinutes(startTime);
+
+    // Filter out future trips for today so they don't show up at the top
+    if (selectedDate === todayStr && shiftMinutes > currentMinutes) {
+      return false;
+    }
+
+    if (!query) return true;
     const vId = getTripVehicleId(shift);
     const formattedStartTime = format12HourTime(startTime).toLowerCase();
     const fleet = formatFleetLabel(vId).toLowerCase();
