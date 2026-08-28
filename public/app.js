@@ -566,7 +566,6 @@ async function openRouteHistoryModal(routeDisplay, specificTrip = null) {
     const now = new Date();
     const todayStr = toDateStr(now);
 
-    // Filter out future dates (e.g., Saturday) so the dropdown starts at today
     days = days.filter(d => d <= todayStr);
 
     if (!days.includes(todayStr)) {
@@ -575,7 +574,7 @@ async function openRouteHistoryModal(routeDisplay, specificTrip = null) {
 
     if (dateSelect) {
       dateSelect.innerHTML = days.map(d => `<option value="${escapeHtml(d)}">${escapeHtml(d)}</option>`).join('');
-      dateSelect.value = todayStr; // Guarantees today is explicitly selected
+      dateSelect.value = todayStr;
     }
 
     const routeModal = document.getElementById('route-history-modal');
@@ -638,11 +637,10 @@ async function loadRouteHistoryForSelectedDate() {
       return;
     }
 
+    // Direct descending sort based on parsed minutes without early morning offset logic
     activeRouteShifts.sort((a, b) => {
       let aMins = parseTimeToMinutes(getTripStartTime(a));
       let bMins = parseTimeToMinutes(getTripStartTime(b));
-      if (aMins < 240) aMins += 1440;
-      if (bMins < 240) bMins += 1440;
       return bMins - aMins;
     });
 
@@ -655,7 +653,6 @@ async function loadRouteHistoryForSelectedDate() {
 
 /**
  * Generates "(commenced on DD/MM/YYYY)" tag for early morning runs.
- * Now steps backward one day, as the physical date stems from the continuation of the previous evening.
  */
 function getCommencedTag(startTimeStr, selectedDateStr) {
   if (!isEarlyMorningTrip(startTimeStr) || !selectedDateStr) return '';
@@ -688,15 +685,18 @@ function renderFilteredRouteDepartures() {
 
   const filtered = activeRouteShifts.filter((shift) => {
     const startTime = getTripStartTime(shift);
+    const vId = getTripVehicleId(shift);
+    
+    // Ignore invalid/empty phantom shift objects that lack both time and vehicle info
+    if (!startTime && !vId) return false;
+
     const shiftMinutes = parseTimeToMinutes(startTime);
 
-    // Filter out future trips for today so they don't show up at the top
     if (selectedDate === todayStr && shiftMinutes > currentMinutes) {
       return false;
     }
 
     if (!query) return true;
-    const vId = getTripVehicleId(shift);
     const formattedStartTime = format12HourTime(startTime).toLowerCase();
     const fleet = formatFleetLabel(vId).toLowerCase();
     const route = String(shift.route_display || '').toLowerCase();
@@ -793,11 +793,10 @@ async function handleShiftCheckClick(btnEl) {
 
     const filteredHistory = processShiftTrips(history, targetDate);
 
+    // Standard descending sort without early morning offset logic
     filteredHistory.sort((a, b) => {
       let aM = parseTimeToMinutes(getTripStartTime(a));
       let bM = parseTimeToMinutes(getTripStartTime(b));
-      if (aM < 240) aM += 1440;
-      if (bM < 240) bM += 1440;
       return bM - aM;
     });
 
