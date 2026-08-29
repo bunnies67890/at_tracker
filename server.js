@@ -205,7 +205,8 @@ function timeStrToSeconds(timeStr) {
   if (!timeStr) return 0;
   const parts = String(timeStr).split(':');
   if (parts.length < 2) return 0;
-  const hours = parseInt(parts[0], 10) % 24;
+  
+  const hours = parseInt(parts[0], 10); // Removed % 24 here
   return hours * 3600 + parseInt(parts[1], 10) * 60 + parseInt(parts[2] || 0, 10);
 }
 
@@ -302,8 +303,6 @@ async function loadOrFetchGtfsData() {
       stopNamesMap = {};
       routeDisplayToTripsMap = {};
       tripIsOvernightMap = {};
-      calendarServices = {};   // Reset on refresh
-      calendarExceptions = {}; // Reset on refresh
 
       const stopsEntry = zip.getEntry('stops.txt');
       if (stopsEntry) {
@@ -353,9 +352,9 @@ async function loadOrFetchGtfsData() {
         const exRows = parse(calExEntry.getData().toString('utf8'), { columns: true, skip_empty_lines: true, trim: true });
         exRows.forEach(ex => {
           const sId = ex.service_id?.trim();
-          const dt = ex.date ? String(ex.date).trim() : '';
+          const dt = ex.date?.trim();
           const type = parseInt(ex.exception_type, 10);
-          if (sId && dt && !isNaN(type)) {
+          if (sId && dt) {
             if (!calendarExceptions[sId]) calendarExceptions[sId] = {};
             calendarExceptions[sId][dt] = type;
           }
@@ -647,18 +646,18 @@ app.get('/api/buses/live', async (req, res) => {
 
       const nowAklHour = new Date(new Date().toLocaleString("en-US", { timeZone: "Pacific/Auckland" })).getHours();
 
-      liveBuses.forEach((b) => {
-        if (b.route_display !== 'NIS') {
-          const startMins = timeStrToMinutes(b.start_time);
-          const baseId = extractBaseTripId(b.trip_id);
-          const isOvernightTrip = tripIsOvernightMap[b.trip_id] || tripIsOvernightMap[baseId];
+ liveBuses.forEach((b) => {
+  if (b.route_display !== 'NIS') {
+    const startMins = timeStrToMinutes(b.start_time);
+    const baseId = extractBaseTripId(b.trip_id);
+    const isOvernightTrip = tripIsOvernightMap[b.trip_id] || tripIsOvernightMap[baseId];
 
-          let targetDay = todayStr;
-          
-          // Rewind to previous day if running during early morning hours and trip is PM or GTFS 24:00+
-          if (nowAklHour < 5 && (startMins >= 720 || isOvernightTrip)) {
-            targetDay = getPreviousDateStr(todayStr);
-          }
+    let targetDay = todayStr;
+    
+    // Rewind to previous day if running during early morning hours and trip is PM or GTFS 24:00+
+    if (nowAklHour < 5 && (startMins >= 720 || isOvernightTrip)) {
+      targetDay = getPreviousDateStr(todayStr);
+    }
 
           stmt.run([b.vehicle_id, b.trip_id, b.route_display, b.origin, b.destination, targetDay, b.start_time, b.tardiness], (err) => {
             if (err) console.error('[DB] shift_history upsert failed:', err.message);
@@ -687,29 +686,46 @@ app.get('/api/stops/:id/departures', (req, res) => {
   const rawDeps = stopDeparturesMap[stopId] || [];
 
   const nowAkl = new Date(new Date().toLocaleString("en-US", { timeZone: "Pacific/Auckland" }));
-  const currentSeconds = nowAkl.getHours() * 3600 + nowAkl.getMinutes() * 60 + nowAkl.getSeconds();
+  const currentHour = nowAkl.getHours();
+  const currentSeconds = currentHour * 3600 + nowAkl.getMinutes() * 60 + nowAkl.getSeconds();
+  
   const todayStr = getNZDateStr();
+  const yesterdayStr = getPreviousDateStr(todayStr);
 
   const seenKeys = new Set();
   const upcoming = [];
 
   for (const d of rawDeps) {
     const serviceId = tripServiceMap[d.trip_id] || tripServiceMap[extractBaseTripId(d.trip_id)];
-    if (serviceId && !isServiceActiveOnDate(serviceId, todayStr)) {
+    let rawSeconds = timeStrToSeconds(d.timeStr);
+    
+    let activeDate = todayStr;
+    let compareSeconds = rawSeconds;
+
+    // GTFS trips with hours >= 24 belong to yesterday's service calendar
+    if (rawSeconds >= 86400) {
+      activeDate = yesterdayStr;
+      
+      // If currently early morning (12 AM - 5 AM), normalize 24:xx+ trip times back to 0-86400 range for comparison
+      if (currentHour < 5) {
+        compareSeconds = rawSeconds - 86400;
+      }
+    }
+
+    if (serviceId && !isServiceActiveOnDate(serviceId, activeDate)) {
       continue;
     }
 
-    const seconds = timeStrToSeconds(d.timeStr);
-    if (seconds < currentSeconds) continue;
+    if (compareSeconds < currentSeconds) continue;
 
     const dedupKey = `${d.route}_${d.origin}_${d.destination}_${d.timeStr}`;
     if (seenKeys.has(dedupKey)) continue;
     seenKeys.add(dedupKey);
 
-    upcoming.push({ ...d, seconds });
+    upcoming.push({ ...d, compareSeconds });
   }
 
-  upcoming.sort((a, b) => a.seconds - b.seconds);
+  upcoming.sort((a, b) => a.compareSeconds - b.compareSeconds);
 
   const departures = upcoming.map(d => ({
     route: d.route,
