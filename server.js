@@ -22,6 +22,18 @@ const db = new sqlite3.Database(dbPath, (err) => {
   if (err) console.error('Database connection error:', err.message);
 });
 
+// Promise helpers used only for the one-time schema migration below
+function dbGet(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => (err ? reject(err) : resolve(row)));
+  });
+}
+function dbRun(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function (err) { err ? reject(err) : resolve(this); });
+  });
+}
+
 // Helper: Standardize local date in Pacific/Auckland timezone (YYYY-MM-DD)
 function getNZDateStr(date = new Date()) {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'Pacific/Auckland' }).format(date);
@@ -35,6 +47,65 @@ function getPreviousDateStr(dateStr) {
   return d.toISOString().split('T')[0];
 }
 
+/**
+ * BUG FIX: the original schema had `trip_id TEXT UNIQUE` as a single-column
+ * constraint. AT commonly re-uses the exact same trip_id string on a LATER
+ * calendar day (trip IDs are schedule-relative, not date-specific), so the
+ * very first day a given trip_id was ever seen becomes the ONLY day it can
+ * ever be recorded under - every subsequent day's occurrence just silently
+ * updates that same stale row via ON CONFLICT, and the row's `day` field
+ * never advances. That's why a trip can be actively tracking live while its
+ * shift-history entry still says it never ran "today": the row exists, but
+ * it's dated several days in the past and gets filtered out.
+ *
+ * The fix: trips are only truly unique per (trip_id, day). This migration
+ * detects the old schema and safely upgrades it in place, preserving all
+ * existing rows. It's a no-op (skipped entirely) once already migrated, so
+ * it's safe to leave running on every startup.
+ */
+async function migrateToCompositeUniqueness() {
+  const tableInfo = await dbGet(
+    `SELECT sql FROM sqlite_master WHERE type='table' AND name='shift_history'`
+  );
+
+  if (!tableInfo) return; // table doesn't exist yet - CREATE TABLE below will make the new schema directly
+
+  const hasOldConstraint = /trip_id\s+TEXT\s+UNIQUE/i.test(tableInfo.sql);
+  if (!hasOldConstraint) {
+    console.log('[DB migration] Schema already up to date.');
+    return;
+  }
+
+  console.log('[DB migration] Old single-column UNIQUE(trip_id) detected - migrating to UNIQUE(trip_id, day)...');
+  try {
+    await dbRun(`
+      CREATE TABLE shift_history_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        vehicle_id TEXT,
+        trip_id TEXT,
+        route_display TEXT,
+        origin TEXT,
+        destination TEXT,
+        day TEXT,
+        start_time TEXT,
+        tardiness TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await dbRun(`
+      INSERT INTO shift_history_new (vehicle_id, trip_id, route_display, origin, destination, day, start_time, tardiness, created_at)
+      SELECT vehicle_id, trip_id, route_display, origin, destination, day, start_time, tardiness, created_at
+      FROM shift_history
+    `);
+    await dbRun(`DROP TABLE shift_history`);
+    await dbRun(`ALTER TABLE shift_history_new RENAME TO shift_history`);
+    await dbRun(`CREATE UNIQUE INDEX IF NOT EXISTS idx_shift_history_trip_day ON shift_history(trip_id, day)`);
+    console.log('[DB migration] Done - existing history preserved.');
+  } catch (e) {
+    console.error('[DB migration] FAILED:', e.message);
+  }
+}
+
 db.serialize(() => {
   db.run("PRAGMA journal_mode = WAL;");
   db.run("PRAGMA synchronous = NORMAL;");
@@ -43,7 +114,7 @@ db.serialize(() => {
     CREATE TABLE IF NOT EXISTS shift_history (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       vehicle_id TEXT,
-      trip_id TEXT UNIQUE,
+      trip_id TEXT,
       route_display TEXT,
       origin TEXT,
       destination TEXT,
@@ -52,8 +123,12 @@ db.serialize(() => {
       tardiness TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
-  `, () => {
+  `, async () => {
     db.run(`ALTER TABLE shift_history ADD COLUMN origin TEXT`, (err) => {});
+    await migrateToCompositeUniqueness();
+    db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_shift_history_trip_day ON shift_history(trip_id, day)`, (err) => {
+      if (err) console.error('[DB] Could not create composite unique index:', err.message);
+    });
   });
 });
 
@@ -526,20 +601,36 @@ app.get('/api/buses/live', async (req, res) => {
 
     db.serialize(() => {
       db.run("BEGIN TRANSACTION;");
+      // BUG FIX: previously only updated tardiness/origin/destination on conflict,
+      // so start_time and vehicle_id got permanently frozen at whatever they were
+      // on the FIRST poll for a given trip_id - if that first read happened before
+      // GTFS static data had finished loading, the wrong value stuck forever.
+      // Also switched the conflict target to (trip_id, day): see the migration
+      // above for why trip_id alone isn't a safe uniqueness key.
       const stmt = db.prepare(`
         INSERT INTO shift_history (vehicle_id, trip_id, route_display, origin, destination, day, start_time, tardiness)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(trip_id) DO UPDATE SET tardiness = excluded.tardiness, origin = excluded.origin, destination = excluded.destination
+        ON CONFLICT(trip_id, day) DO UPDATE SET
+          vehicle_id = excluded.vehicle_id,
+          route_display = excluded.route_display,
+          origin = excluded.origin,
+          destination = excluded.destination,
+          start_time = excluded.start_time,
+          tardiness = excluded.tardiness
       `);
 
       liveBuses.forEach((b) => {
         if (b.route_display !== 'NIS') {
-          stmt.run([b.vehicle_id, b.trip_id, b.route_display, b.origin, b.destination, todayStr, b.start_time, b.tardiness]);
+          stmt.run([b.vehicle_id, b.trip_id, b.route_display, b.origin, b.destination, todayStr, b.start_time, b.tardiness], (err) => {
+            if (err) console.error('[DB] shift_history upsert failed:', err.message);
+          });
         }
       });
 
       stmt.finalize();
-      db.run("COMMIT;");
+      db.run("COMMIT;", (err) => {
+        if (err) console.error('[DB] COMMIT failed:', err.message);
+      });
     });
 
     res.json(liveBuses);
@@ -594,8 +685,13 @@ app.get('/api/stops/:id/departures', (req, res) => {
 
 app.get('/api/history/bus/:vehicleId', (req, res) => {
   const vId = req.params.vehicleId.trim().toUpperCase();
+  // BUG FIX: this SELECT previously omitted vehicle_id and trip_id entirely.
+  // The frontend uses vehicle_id per-row to decide whether a shift is a real
+  // tracked observation vs a synthesized "Scheduled" placeholder - without it,
+  // EVERY row from this endpoint looked unattributed and displayed as
+  // "Scheduled" regardless of its actual recorded tardiness.
   db.all(
-    `SELECT route_display, origin, destination, day, start_time, tardiness FROM shift_history WHERE vehicle_id = ? ORDER BY id DESC LIMIT 50`,
+    `SELECT vehicle_id, trip_id, route_display, origin, destination, day, start_time, tardiness FROM shift_history WHERE vehicle_id = ? ORDER BY id DESC LIMIT 50`,
     [vId],
     (err, rows) => {
       if (err) return res.status(500).json([]);

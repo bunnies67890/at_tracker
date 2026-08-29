@@ -25,9 +25,6 @@ const KNOWN_EXPRESS_ROUTES = new Set([
   'NX1', 'NX2', 'WX1', 'CTY', 'TMK', 'AIR', 'INN', 'OUT', 'STH', 'EAST', 'WEST', 'ONE', 'DEV', 'RANG', 'MTIA', 'HOBS', 'GULF', 'HMB', 'PINE', 'MTID', 'BAYS', 'BIRK', 'TIRI', 'F', 'WSTH', 'S-C', 'E-W', 'O-W'
 ]);
 
-/**
- * Helper: Safely extracts departure/start time across flexible API field names.
- */
 function getTripStartTime(trip) {
   if (!trip || typeof trip !== 'object') return '';
   return trip.start_time || 
@@ -38,17 +35,11 @@ function getTripStartTime(trip) {
          trip.origin_departure_time || '';
 }
 
-/**
- * Helper: Safely extracts vehicle ID across flexible API field names.
- */
 function getTripVehicleId(trip) {
   if (!trip || typeof trip !== 'object') return '';
   return trip.vehicle_id || trip.fleet_id || trip.bus_id || trip.vehicle || '';
 }
 
-/**
- * Helper: Escapes HTML strings to prevent rendering issues and attribute syntax breakage.
- */
 function escapeHtml(str) {
   if (str === null || str === undefined) return '';
   return String(str)
@@ -59,18 +50,11 @@ function escapeHtml(str) {
     .replace(/'/g, '&#039;');
 }
 
-/**
- * Helper: Normalizes a date into YYYY-MM-DD string using Auckland local time.
- */
 function toDateStr(dateObj) {
   if (!(dateObj instanceof Date) || isNaN(dateObj.getTime())) return '';
   return dateObj.toLocaleDateString('en-CA', { timeZone: 'Pacific/Auckland' });
 }
 
-/**
- * Parses time into minutes from midnight (0 to 1439).
- * Handles HH:MM, HH:MM:SS, 12-hour AM/PM, and ISO string variations.
- */
 function parseTimeToMinutes(timeStr) {
   if (!timeStr) return 0;
   let s = String(timeStr).trim();
@@ -103,9 +87,6 @@ function parseTimeToMinutes(timeStr) {
   return hours * 60 + minutes;
 }
 
-/**
- * Formats time into clean 12-hour AM/PM format.
- */
 function format12HourTime(rawTime) {
   if (!rawTime) return 'N/A';
   let s = String(rawTime).trim();
@@ -147,17 +128,11 @@ function format12HourTime(rawTime) {
   return `${hours}:${minutes} ${period}`;
 }
 
-/**
- * Helper: Determines if a start time is early morning (12:00 AM - 3:59 AM / 0 - 239 mins).
- */
 function isEarlyMorningTrip(timeStr) {
   const mins = parseTimeToMinutes(timeStr);
   return mins >= 0 && mins < 240;
 }
 
-/**
- * Converts ISO timestamps or raw dates into local YYYY-MM-DD strings.
- */
 function getShiftLocalDate(shift) {
   if (!shift || typeof shift !== 'object') return '';
 
@@ -208,9 +183,6 @@ function isTripOverdue(startTimeStr, selectedDay) {
   return nowInMinutes > tripMinutes;
 }
 
-/**
- * Filters shift trips for a target selected date.
- */
 function processShiftTrips(shiftTrips, selectedDateStr) {
   if (!Array.isArray(shiftTrips) || shiftTrips.length === 0) return [];
   if (!selectedDateStr) return shiftTrips;
@@ -663,9 +635,6 @@ async function loadRouteHistoryForSelectedDate() {
   }
 }
 
-/**
- * Generates "(commenced on DD/MM/YYYY)" tag for early morning runs.
- */
 function getCommencedTag(startTimeStr, selectedDateStr) {
   if (!isEarlyMorningTrip(startTimeStr) || !selectedDateStr) return '';
 
