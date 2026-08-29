@@ -195,6 +195,19 @@ function getShiftLocalDate(shift) {
   return '';
 }
 
+function isTripOverdue(startTimeStr, selectedDay) {
+  const todayNZ = new Date().toLocaleDateString('en-CA', { timeZone: 'Pacific/Auckland' });
+  if (selectedDay !== todayNZ) return false;
+
+  const now = new Date();
+  const nzTimeString = now.toLocaleTimeString('en-GB', { timeZone: 'Pacific/Auckland', hour: '2-digit', minute: '2-digit' });
+  const [currentHours, currentMinutes] = nzTimeString.split(':').map(Number);
+  const nowInMinutes = currentHours * 60 + currentMinutes;
+
+  const tripMinutes = parseTimeToMinutes(startTimeStr);
+  return nowInMinutes > tripMinutes;
+}
+
 /**
  * Filters shift trips for a target selected date.
  */
@@ -637,7 +650,6 @@ async function loadRouteHistoryForSelectedDate() {
       return;
     }
 
-    // Direct descending sort based on parsed minutes without early morning offset logic
     activeRouteShifts.sort((a, b) => {
       let aMins = parseTimeToMinutes(getTripStartTime(a));
       let bMins = parseTimeToMinutes(getTripStartTime(b));
@@ -687,7 +699,6 @@ function renderFilteredRouteDepartures() {
     const startTime = getTripStartTime(shift);
     const vId = getTripVehicleId(shift);
     
-    // Ignore invalid/empty phantom shift objects that lack both time and vehicle info
     if (!startTime && !vId) return false;
 
     const shiftMinutes = parseTimeToMinutes(startTime);
@@ -719,7 +730,7 @@ function renderFilteredRouteDepartures() {
     const tripTitle = formatTripTitle(shift.route_display, shift.origin, shift.destination);
     const formattedStartTime = format12HourTime(startTime);
     const shiftMinutes = parseTimeToMinutes(startTime);
-    const commencedTag = getCommencedTag(startTime, selectedDate);
+    let commencedTag = getCommencedTag(startTime, selectedDate);
     
     const targetVId = targetTripContext ? getTripVehicleId(targetTripContext) : '';
     const targetStartTime = targetTripContext ? getTripStartTime(targetTripContext) : '';
@@ -738,6 +749,19 @@ function renderFilteredRouteDepartures() {
       tardinessDisplay = 'Scheduled';
     }
 
+    if (shiftMinutes === 0) {
+      const actualDate = new Date(selectedDate + 'T00:00:00');
+      actualDate.setDate(actualDate.getDate() + 1);
+
+      const dd = String(actualDate.getDate()).padStart(2, '0');
+      const mm = String(actualDate.getMonth() + 1).padStart(2, '0');
+      const yyyy = actualDate.getFullYear();
+
+      commencedTag = ` <span style="color: #666; font-weight: normal; font-size: 12px;">(commenced on ${dd}/${mm}/${yyyy})</span>`;
+    }
+
+    const isOverdue = isScheduled && (selectedDate === todayStr) && (shiftMinutes < currentMinutes);
+
     return `
       <div class="departure-row ${isTarget ? 'highlighted-target-trip' : ''}">
         ${isTarget ? '<span class="target-badge">Selected Route Trip</span>' : ''}
@@ -745,6 +769,12 @@ function renderFilteredRouteDepartures() {
           <span>Start: <strong>${escapeHtml(formattedStartTime)}</strong>${commencedTag} | Fleet: ${fleetDisplay}</span>
           <span><strong>${escapeHtml(tardinessDisplay)}</strong></span>
         </div>
+        ${isOverdue ? `
+          <div style="background-color: #fee2e2; border: 1px solid #ef4444; color: #991b1b; padding: 6px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; margin-top: 6px; display: flex; align-items: center; gap: 6px;">
+            <span>⚠️</span>
+            <span>No Tracking Available. This bus is either delayed or cancelled</span>
+          </div>
+        ` : ''}
         <div style="font-size: 13px; font-weight: 600; color: #222;">${escapeHtml(tripTitle)}</div>
         ${isScheduled ? '' : `
           <button class="btn-shift-check" 
@@ -793,7 +823,6 @@ async function handleShiftCheckClick(btnEl) {
 
     const filteredHistory = processShiftTrips(history, targetDate);
 
-    // Standard descending sort without early morning offset logic
     filteredHistory.sort((a, b) => {
       let aM = parseTimeToMinutes(getTripStartTime(a));
       let bM = parseTimeToMinutes(getTripStartTime(b));
@@ -842,7 +871,7 @@ function renderShiftListItems(history, targetStartTime, targetRouteDisplay, targ
     return `
       <li style="${isThisRun ? 'color: #d9381e; font-weight: 600;' : ''}">
         ${escapeHtml(formattedTime)} - ${escapeHtml(h.route_display || '')}${destDisplay} (${escapeHtml(h.tardiness || 'On Time')})${commencedTag}
-        ${isThisRun ? '<span style="color: #d9381e; font-weight: 700; margin-left: 6px;">(this run)</span>' : ''}
+        ${isThisRun ? ' <span style="color: #d9381e; font-weight: 700; margin-left: 6px;">(this run)</span>' : ''}
       </li>
     `;
   }).join('');
@@ -867,9 +896,9 @@ function filterShiftDetails(inputEl) {
     const dest = formatCleanDestination(h.destination).toLowerCase();
     const tardiness = String(h.tardiness || '').toLowerCase();
 
-    return timeFormatted.includes(query) || 
-           route.includes(query) || 
-           dest.includes(query) || 
+    return timeFormatted.includes(query) ||
+           route.includes(query) ||
+           dest.includes(query) ||
            tardiness.includes(query);
   });
 
