@@ -14,6 +14,11 @@ app.use(express.static(path.join(__dirname, 'public')));
 const AT_API_KEY = process.env.AT_API_KEY;
 console.log('DEBUG CHECK:', AT_API_KEY ? `Key exists (${AT_API_KEY.length} chars)` : 'KEY IS BLANK OR UNDEFINED');
 
+function getDiscordWebhookUrl() {
+  // Pulls securely from Railway Variables
+  return process.env.DISCORD_WEBHOOK_URL ? process.env.DISCORD_WEBHOOK_URL.trim() : '';
+}
+
 const dbPath = process.env.RAILWAY_VOLUME_MOUNT_PATH 
   ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'bus_history.db') 
   : path.join(__dirname, 'bus_history.db');
@@ -920,6 +925,41 @@ app.get('/api/admin/refresh-gtfs', async (req, res) => {
     res.json({ success: true, message: 'GTFS static data successfully refreshed!' });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Bug Report Endpoint
+app.post('/api/report-bug', async (req, res) => {
+  try {
+    const { userText, currentRoute, vehicleId } = req.body;
+    const webhookUrl = getDiscordWebhookUrl();
+
+    if (!webhookUrl) {
+      console.error('[Bug Report Error] Webhook URL function returned empty string.');
+      return res.status(500).json({ error: 'Webhook URL not configured on server' });
+    }
+
+    if (!userText || !userText.trim()) {
+      return res.status(400).json({ error: 'Message cannot be empty' });
+    }
+
+    const discordRes = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content: `🚨 **New AT Tracker Bug Report**\n**Route:** ${currentRoute || 'None'}\n**Vehicle:** ${vehicleId || 'None'}\n**Details:** ${userText}`
+      })
+    });
+
+    if (!discordRes.ok) {
+      const errText = await discordRes.text();
+      return res.status(500).json({ error: `Discord rejected request (${discordRes.status}): ${errText}` });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[Bug Report Server Error]', err);
+    res.status(500).json({ error: err.message });
   }
 });
 

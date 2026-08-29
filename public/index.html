@@ -321,6 +321,7 @@
     }
   </style>
 </head>
+
 <body>
 
   <!-- Search Overlay -->
@@ -368,5 +369,113 @@
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="app.js?v=2"></script>
+
+  <!-- What's New / Bug Fixes Modal -->
+<div id="changelog-modal" class="modal" style="display: flex; align-items: center; justify-content: center;">
+  <div class="modal-content" style="margin: 0;">
+    <button class="close-btn" onclick="closeChangelogModal()" aria-label="Close modal">&times;</button>
+    <div id="changelog-title" class="modal-header-title">What's New</div>
+    <div id="changelog-body" style="font-size: 14px; line-height: 1.5; color: #333;"></div>
+    <button onclick="closeChangelogModal()" class="btn-history" style="margin-top: 18px;">Got it</button>
+  </div>
+</div>
+
+<script>
+  // =========================================================
+  // Changelog Content
+  // =========================================================
+  const CHANGELOG_CONFIG = {
+    title: "⚠️ Welcome. Please be aware of the following:",
+    updates: [
+      "This is an EXPERIMENTAL site. We are aware of the following bugs:",
+      "- Night Rider shift logic: 12am Night Rider services display on the previous days shift, but normal 12am services will display correctly. This means, some commenced dates will be wrong.",
+      "- Some shifts dropping off: Specific departures on specific roites will show that the vehicle did not come, but the vehicle did come and is tracking on other sites, as well as ours but the shift is not being added to the history."
+    ]
+  };
+  // =========================================================
+
+  function renderChangelog() {
+    document.getElementById('changelog-title').innerText = CHANGELOG_CONFIG.title;
+    const bodyContainer = document.getElementById('changelog-body');
+    
+    let htmlContent = '<ul style="margin: 0; padding-left: 20px;">';
+    CHANGELOG_CONFIG.updates.forEach(item => {
+      htmlContent += `<li style="margin-bottom: 8px;">${item}</li>`;
+    });
+    htmlContent += '</ul>';
+    
+    bodyContainer.innerHTML = htmlContent;
+  }
+
+  function closeChangelogModal() {
+    document.getElementById('changelog-modal').style.display = 'none';
+  }
+
+  document.addEventListener('DOMContentLoaded', renderChangelog);
+</script>
+
+<!-- Bug Report Trigger Button (Positioned top-right of screen) -->
+<button 
+  onclick="openBugModal()" 
+  style="position: absolute; top: 15px; right: 15px; z-index: 2000; background: #dc3545; color: white; border: none; padding: 8px 14px; border-radius: 6px; font-weight: bold; cursor: pointer; box-shadow: 0 2px 6px rgba(0,0,0,0.2);">
+  🐛 Report Bug
+</button>
+
+<!-- Bug Report Modal -->
+<div id="bug-modal" class="modal">
+  <div class="modal-content">
+    <button class="close-btn" onclick="closeBugModal()">&times;</button>
+    <div class="modal-header-title">Report an Issue</div>
+    
+    <label style="font-size: 13px; font-weight: 600; color: #444;">Describe the bug:</label>
+    <textarea 
+      id="bug-text" 
+      rows="4" 
+      placeholder="e.g. Route 162 isn't showing the 1pm trip or vehicle 1234 disappeared..." 
+      style="width: 100%; margin-top: 8px; padding: 10px; border-radius: 6px; border: 1px solid #ccc; font-family: inherit; resize: vertical;"
+    ></textarea>
+
+    <button onclick="submitBugReport()" class="btn-history" style="margin-top: 12px; background: #dc3545;">
+      Send Report
+    </button>
+  </div>
+</div>
+
+<script>
+  function openBugModal() {
+    document.getElementById('bug-modal').style.display = 'block';
+  }
+
+  function closeBugModal() {
+    document.getElementById('bug-modal').style.display = 'none';
+    document.getElementById('bug-text').value = '';
+  }
+
+  async function submitBugReport() {
+    const text = document.getElementById('bug-text').value;
+    if (!text.trim()) return alert('Please enter a description.');
+
+    try {
+      const res = await fetch('/api/report-bug', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userText: text,
+          currentRoute: window.selectedRoute || '', 
+          vehicleId: window.selectedVehicle || ''
+        })
+      });
+
+      if (res.ok) {
+        alert('Bug report submitted. Thank you!');
+        closeBugModal();
+      } else {
+        alert('Failed to send report. Please try again.');
+      }
+    } catch (e) {
+      alert('Network error submitting report.');
+    }
+  }
+</script>
 </body>
 </html>
