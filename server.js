@@ -302,6 +302,8 @@ async function loadOrFetchGtfsData() {
       stopNamesMap = {};
       routeDisplayToTripsMap = {};
       tripIsOvernightMap = {};
+      calendarServices = {};   // Reset on refresh
+      calendarExceptions = {}; // Reset on refresh
 
       const stopsEntry = zip.getEntry('stops.txt');
       if (stopsEntry) {
@@ -351,9 +353,9 @@ async function loadOrFetchGtfsData() {
         const exRows = parse(calExEntry.getData().toString('utf8'), { columns: true, skip_empty_lines: true, trim: true });
         exRows.forEach(ex => {
           const sId = ex.service_id?.trim();
-          const dt = ex.date?.trim();
+          const dt = ex.date ? String(ex.date).trim() : '';
           const type = parseInt(ex.exception_type, 10);
-          if (sId && dt) {
+          if (sId && dt && !isNaN(type)) {
             if (!calendarExceptions[sId]) calendarExceptions[sId] = {};
             calendarExceptions[sId][dt] = type;
           }
@@ -648,8 +650,13 @@ app.get('/api/buses/live', async (req, res) => {
       liveBuses.forEach((b) => {
         if (b.route_display !== 'NIS') {
           const startMins = timeStrToMinutes(b.start_time);
+          const baseId = extractBaseTripId(b.trip_id);
+          const isOvernightTrip = tripIsOvernightMap[b.trip_id] || tripIsOvernightMap[baseId];
+
           let targetDay = todayStr;
-          if (nowAklHour < 5 && startMins >= 720) {
+          
+          // Rewind to previous day if running during early morning hours and trip is PM or GTFS 24:00+
+          if (nowAklHour < 5 && (startMins >= 720 || isOvernightTrip)) {
             targetDay = getPreviousDateStr(todayStr);
           }
 
