@@ -22,7 +22,7 @@ const db = new sqlite3.Database(dbPath, (err) => {
   if (err) console.error('Database connection error:', err.message);
 });
 
-// Promise helpers used only for the one-time schema migration below
+// Promise helpers used only for schema migrations
 function dbGet(sql, params = []) {
   return new Promise((resolve, reject) => {
     db.get(sql, params, (err, row) => (err ? reject(err) : resolve(row)));
@@ -47,28 +47,12 @@ function getPreviousDateStr(dateStr) {
   return d.toISOString().split('T')[0];
 }
 
-/**
- * BUG FIX: the original schema had `trip_id TEXT UNIQUE` as a single-column
- * constraint. AT commonly re-uses the exact same trip_id string on a LATER
- * calendar day (trip IDs are schedule-relative, not date-specific), so the
- * very first day a given trip_id was ever seen becomes the ONLY day it can
- * ever be recorded under - every subsequent day's occurrence just silently
- * updates that same stale row via ON CONFLICT, and the row's `day` field
- * never advances. That's why a trip can be actively tracking live while its
- * shift-history entry still says it never ran "today": the row exists, but
- * it's dated several days in the past and gets filtered out.
- *
- * The fix: trips are only truly unique per (trip_id, day). This migration
- * detects the old schema and safely upgrades it in place, preserving all
- * existing rows. It's a no-op (skipped entirely) once already migrated, so
- * it's safe to leave running on every startup.
- */
 async function migrateToCompositeUniqueness() {
   const tableInfo = await dbGet(
     `SELECT sql FROM sqlite_master WHERE type='table' AND name='shift_history'`
   );
 
-  if (!tableInfo) return; // table doesn't exist yet - CREATE TABLE below will make the new schema directly
+  if (!tableInfo) return;
 
   const hasOldConstraint = /trip_id\s+TEXT\s+UNIQUE/i.test(tableInfo.sql);
   if (!hasOldConstraint) {
@@ -106,6 +90,7 @@ async function migrateToCompositeUniqueness() {
   }
 }
 
+// Database Initialization with proper async sequencing to avoid migration race conditions
 db.serialize(() => {
   db.run("PRAGMA journal_mode = WAL;");
   db.run("PRAGMA synchronous = NORMAL;");
@@ -123,20 +108,24 @@ db.serialize(() => {
       tardiness TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
-  `, async () => {
-    db.run(`ALTER TABLE shift_history ADD COLUMN origin TEXT`, (err) => {});
+  `, async (err) => {
+    if (err) {
+      console.error('[DB] Initial table creation error:', err.message);
+      return;
+    }
+    // Add origin column if upgrading from legacy schema that lacked it
+    db.run(`ALTER TABLE shift_history ADD COLUMN origin TEXT`, () => {});
+    
     await migrateToCompositeUniqueness();
-    db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_shift_history_trip_day ON shift_history(trip_id, day)`, (err) => {
-      if (err) console.error('[DB] Could not create composite unique index:', err.message);
+
+    db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_shift_history_trip_day ON shift_history(trip_id, day)`, (idxErr) => {
+      if (idxErr) console.error('[DB] Could not create composite unique index:', idxErr.message);
     });
   });
 });
 
 function purgeOldHistory() {
-  // Subtract 6 days to keep 7 total days including today
   const d = new Date(Date.now() - 6 * 24 * 60 * 60 * 1000); 
-  
-  // Guarantees YYYY-MM-DD format in NZ time
   const cutoffDate = d.toLocaleDateString('en-CA', { timeZone: 'Pacific/Auckland' });
 
   db.run(`DELETE FROM shift_history WHERE day < ?`, [cutoffDate], (err) => {
@@ -338,7 +327,6 @@ async function loadOrFetchGtfsData() {
         });
       }
 
-      const stopTimesEntry = zip.getEntry('stop_times.txt');
       const tripMinSeqTime = {};
       const tripMinStopName = {};
       const tripMaxStopName = {};
@@ -385,51 +373,63 @@ async function loadOrFetchGtfsData() {
         });
       }
 
+      // Fast line-by-line parsing for stop_times.txt to prevent memory heap exhaustion
+      const stopTimesEntry = zip.getEntry('stop_times.txt');
       if (stopTimesEntry) {
-        const stopTimeRows = parse(stopTimesEntry.getData().toString('utf8'), { columns: true, skip_empty_lines: true, trim: true });
-        stopTimeRows.forEach((st) => {
-          const tId = st.trip_id?.trim();
-          const seq = parseInt(st.stop_sequence, 10);
-          const depTime = st.departure_time?.trim();
-          const sId = st.stop_id?.trim();
+        const lines = stopTimesEntry.getData().toString('utf8').split(/\r?\n/);
+        if (lines.length > 0) {
+          const header = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+          const tripIdIdx = header.indexOf('trip_id');
+          const seqIdx = header.indexOf('stop_sequence');
+          const depTimeIdx = header.indexOf('departure_time');
+          const stopIdIdx = header.indexOf('stop_id');
 
-          if (tId && depTime) {
-            const hour = parseInt(depTime.split(':')[0], 10);
-            if (!isNaN(hour) && hour >= 24) {
-              tripIsOvernightMap[tId] = true;
-              tripIsOvernightMap[extractBaseTripId(tId)] = true;
-            }
-          }
+          for (let i = 1; i < lines.length; i++) {
+            if (!lines[i]) continue;
+            const cols = lines[i].split(',').map(c => c.trim().replace(/^"|"$/g, ''));
+            const tId = cols[tripIdIdx];
+            const seq = parseInt(cols[seqIdx], 10);
+            const depTime = cols[depTimeIdx];
+            const sId = cols[stopIdIdx];
 
-          if (tId && !isNaN(seq)) {
-            if (depTime && (!tripMinSeqTime[tId] || seq < tripMinSeqTime[tId].seq)) {
-              tripMinSeqTime[tId] = { seq, time: depTime };
-            }
-            if (sId && stopNamesMap[sId]) {
-              if (!tripMinStopName[tId] || seq < tripMinStopName[tId].seq) {
-                tripMinStopName[tId] = { seq, name: stopNamesMap[sId] };
-              }
-              if (!tripMaxStopName[tId] || seq > tripMaxStopName[tId].seq) {
-                tripMaxStopName[tId] = { seq, name: stopNamesMap[sId] };
+            if (tId && depTime) {
+              const hour = parseInt(depTime.split(':')[0], 10);
+              if (!isNaN(hour) && hour >= 24) {
+                tripIsOvernightMap[tId] = true;
+                tripIsOvernightMap[extractBaseTripId(tId)] = true;
               }
             }
-          }
 
-          if (tId && sId && depTime) {
-            const meta = tripMetaMap[tId] || tripMetaMap[extractBaseTripId(tId)] || { route: 'N/A', destination: 'N/A' };
-            const originName = tripMinStopName[tId]?.name || '';
-            const destName = meta.destination || tripMaxStopName[tId]?.name || 'N/A';
+            if (tId && !isNaN(seq)) {
+              if (depTime && (!tripMinSeqTime[tId] || seq < tripMinSeqTime[tId].seq)) {
+                tripMinSeqTime[tId] = { seq, time: depTime };
+              }
+              if (sId && stopNamesMap[sId]) {
+                if (!tripMinStopName[tId] || seq < tripMinStopName[tId].seq) {
+                  tripMinStopName[tId] = { seq, name: stopNamesMap[sId] };
+                }
+                if (!tripMaxStopName[tId] || seq > tripMaxStopName[tId].seq) {
+                  tripMaxStopName[tId] = { seq, name: stopNamesMap[sId] };
+                }
+              }
+            }
 
-            if (!stopDeparturesMap[sId]) stopDeparturesMap[sId] = [];
-            stopDeparturesMap[sId].push({
-              trip_id: tId,
-              route: meta.route,
-              origin: originName,
-              destination: destName,
-              timeStr: depTime
-            });
+            if (tId && sId && depTime) {
+              const meta = tripMetaMap[tId] || tripMetaMap[extractBaseTripId(tId)] || { route: 'N/A', destination: 'N/A' };
+              const originName = tripMinStopName[tId]?.name || '';
+              const destName = meta.destination || tripMaxStopName[tId]?.name || 'N/A';
+
+              if (!stopDeparturesMap[sId]) stopDeparturesMap[sId] = [];
+              stopDeparturesMap[sId].push({
+                trip_id: tId,
+                route: meta.route,
+                origin: originName,
+                destination: destName,
+                timeStr: depTime
+              });
+            }
           }
-        });
+        }
       }
 
       for (const tId in tripMinSeqTime) {
@@ -601,12 +601,6 @@ app.get('/api/buses/live', async (req, res) => {
 
     db.serialize(() => {
       db.run("BEGIN TRANSACTION;");
-      // BUG FIX: previously only updated tardiness/origin/destination on conflict,
-      // so start_time and vehicle_id got permanently frozen at whatever they were
-      // on the FIRST poll for a given trip_id - if that first read happened before
-      // GTFS static data had finished loading, the wrong value stuck forever.
-      // Also switched the conflict target to (trip_id, day): see the migration
-      // above for why trip_id alone isn't a safe uniqueness key.
       const stmt = db.prepare(`
         INSERT INTO shift_history (vehicle_id, trip_id, route_display, origin, destination, day, start_time, tardiness)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -683,15 +677,11 @@ app.get('/api/stops/:id/departures', (req, res) => {
   res.json(departures);
 });
 
+// Increased LIMIT from 50 to 300 to retain complete multi-day history
 app.get('/api/history/bus/:vehicleId', (req, res) => {
   const vId = req.params.vehicleId.trim().toUpperCase();
-  // BUG FIX: this SELECT previously omitted vehicle_id and trip_id entirely.
-  // The frontend uses vehicle_id per-row to decide whether a shift is a real
-  // tracked observation vs a synthesized "Scheduled" placeholder - without it,
-  // EVERY row from this endpoint looked unattributed and displayed as
-  // "Scheduled" regardless of its actual recorded tardiness.
   db.all(
-    `SELECT vehicle_id, trip_id, route_display, origin, destination, day, start_time, tardiness FROM shift_history WHERE vehicle_id = ? ORDER BY id DESC LIMIT 50`,
+    `SELECT vehicle_id, trip_id, route_display, origin, destination, day, start_time, tardiness FROM shift_history WHERE vehicle_id = ? ORDER BY id DESC LIMIT 300`,
     [vId],
     (err, rows) => {
       if (err) return res.status(500).json([]);
