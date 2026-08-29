@@ -15,7 +15,6 @@ const AT_API_KEY = process.env.AT_API_KEY;
 console.log('DEBUG CHECK:', AT_API_KEY ? `Key exists (${AT_API_KEY.length} chars)` : 'KEY IS BLANK OR UNDEFINED');
 
 function getDiscordWebhookUrl() {
-  // Pulls securely from Railway Variables
   return process.env.DISCORD_WEBHOOK_URL ? process.env.DISCORD_WEBHOOK_URL.trim() : '';
 }
 
@@ -27,7 +26,6 @@ const db = new sqlite3.Database(dbPath, (err) => {
   if (err) console.error('Database connection error:', err.message);
 });
 
-// Promise helpers used only for schema migrations
 function dbGet(sql, params = []) {
   return new Promise((resolve, reject) => {
     db.get(sql, params, (err, row) => (err ? reject(err) : resolve(row)));
@@ -39,7 +37,6 @@ function dbRun(sql, params = []) {
   });
 }
 
-// Helper: Standardize local date in Pacific/Auckland timezone (YYYY-MM-DD)
 function getNZDateStr(date = new Date()) {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'Pacific/Auckland' }).format(date);
 }
@@ -95,7 +92,6 @@ async function migrateToCompositeUniqueness() {
   }
 }
 
-// Database Initialization with proper async sequencing
 db.serialize(() => {
   db.run("PRAGMA journal_mode = WAL;");
   db.run("PRAGMA synchronous = NORMAL;");
@@ -125,6 +121,18 @@ db.serialize(() => {
     db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_shift_history_trip_day ON shift_history(trip_id, day)`, (idxErr) => {
       if (idxErr) console.error('[DB] Could not create composite unique index:', idxErr.message);
     });
+
+    // Cleanup mis-tagged duplicate PM trips saved under next morning's date
+    db.run(`
+      DELETE FROM shift_history 
+      WHERE id IN (
+        SELECT h2.id 
+        FROM shift_history h1
+        JOIN shift_history h2 ON h1.trip_id = h2.trip_id 
+        WHERE h2.day > h1.day 
+          AND (h2.start_time LIKE '%PM%' OR CAST(SUBSTR(h2.start_time, 1, INSTR(h2.start_time, ':') - 1) AS INT) >= 6)
+      )
+    `);
   });
 });
 
@@ -168,7 +176,6 @@ function cleanHeadsign(raw) {
 function parseRouteDisplay(routeId) {
   if (!routeId) return 'NIS';
   let clean = String(routeId).split('-')[0].replace(/^0+/, '');
-  // Clean 5-digit variant route IDs (e.g., 16201 -> 162, 92602 -> 926)
   if (/^\d{5}$/.test(clean)) {
     clean = clean.substring(0, 3);
   }
@@ -223,7 +230,6 @@ function timeStrToMinutes(timeStr) {
   return hours * 60 + minutes;
 }
 
-// Quote-safe CSV parser to prevent comma-containing stop names from throwing off column indices
 function parseCsvLine(line) {
   const result = [];
   let current = '';
@@ -246,12 +252,10 @@ function isServiceActiveOnDate(serviceId, dateStr) {
   if (!serviceId || !dateStr) return false;
   const cleanDate = dateStr.replace(/-/g, '');
 
-  // 1. Explicit calendar_dates exception check (1 = Added service, 2 = Removed service)
   if (calendarExceptions[serviceId] && calendarExceptions[serviceId][cleanDate] !== undefined) {
     return calendarExceptions[serviceId][cleanDate] === 1;
   }
 
-  // 2. Regular calendar.txt weekly service check
   const cal = calendarServices[serviceId];
   if (!cal) return false;
 
@@ -402,7 +406,6 @@ async function loadOrFetchGtfsData() {
         });
       }
 
-      // Quote-safe line-by-line parsing for stop_times.txt
       const stopTimesEntry = zip.getEntry('stop_times.txt');
       if (stopTimesEntry) {
         const lines = stopTimesEntry.getData().toString('utf8').split(/\r?\n/);
@@ -495,7 +498,6 @@ async function loadOrFetchGtfsData() {
         const orig = tripOriginMap[tId] || '';
         const dest = meta.destination || tripDestinationMap[tId] || `Route ${rDisp}`;
         const serviceId = meta.service_id;
-        const isOvernight = !!tripIsOvernightMap[tId];
 
         routeDisplayToTripsMap[upperRDisp].push({
           trip_id: tId,
@@ -503,8 +505,7 @@ async function loadOrFetchGtfsData() {
           service_id: serviceId,
           origin: orig,
           destination: dest,
-          start_time: startTime,
-          is_overnight: isOvernight
+          start_time: startTime
         });
       }
     } catch (e) {
@@ -647,11 +648,8 @@ app.get('/api/buses/live', async (req, res) => {
       liveBuses.forEach((b) => {
         if (b.route_display !== 'NIS') {
           const startMins = timeStrToMinutes(b.start_time);
-          
-          // If pinged between 00:00 AM and 04:59 AM for a trip starting 6:00 PM or later,
-          // save under YESTERDAY'S GTFS service date instead of today's calendar date.
           let targetDay = todayStr;
-          if (nowAklHour < 5 && startMins >= 1080) {
+          if (nowAklHour < 5 && startMins >= 720) {
             targetDay = getPreviousDateStr(todayStr);
           }
 
@@ -733,7 +731,6 @@ app.get('/api/history/vehicle-day/:vehicleId', (req, res) => {
   const vehicleId = req.params.vehicleId.trim().toUpperCase();
   const todayStr = getNZDateStr();
   const day = req.query.day || todayStr;
-  const prevDay = getPreviousDateStr(day);
   const isToday = (day === todayStr);
 
   db.all(
@@ -745,10 +742,21 @@ app.get('/api/history/vehicle-day/:vehicleId', (req, res) => {
     (err, rows) => {
       if (err) rows = [];
 
-      const seenTripIds = new Set(rows.map(r => r.trip_id));
+      const nowAkl = new Date(new Date().toLocaleString("en-US", { timeZone: "Pacific/Auckland" }));
+      const currentHour = nowAkl.getHours();
+
+      const validRows = rows.filter(r => {
+        const startMins = timeStrToMinutes(r.start_time);
+        if (isToday && currentHour < 5 && startMins >= 720 && r.tardiness !== 'Scheduled') {
+          return false;
+        }
+        return true;
+      });
+
+      const seenTripIds = new Set(validRows.map(r => r.trip_id));
       let blockIdsToFetch = new Set();
 
-      rows.forEach(r => {
+      validRows.forEach(r => {
         if (r.trip_id) {
           const rawId = String(r.trip_id).trim();
           const baseId = extractBaseTripId(rawId);
@@ -761,25 +769,24 @@ app.get('/api/history/vehicle-day/:vehicleId', (req, res) => {
         }
       });
 
-      let blockExpandedRows = [...rows];
+      let blockExpandedRows = [...validRows];
 
       blockIdsToFetch.forEach(bId => {
         const scheduledTrips = blockToTripsMap[bId] || [];
         scheduledTrips.forEach(st => {
-          const isOvernight = !!tripIsOvernightMap[st.trip_id];
-          const serviceActive = isOvernight 
-            ? isServiceActiveOnDate(st.service_id, prevDay)
-            : isServiceActiveOnDate(st.service_id, day);
+          const tId = st.trip_id;
+          const baseId = extractBaseTripId(tId);
+          const svcId = st.service_id || tripServiceMap[tId] || tripServiceMap[baseId];
 
-          if (serviceActive) {
-            if (!seenTripIds.has(st.trip_id)) {
-              seenTripIds.add(st.trip_id);
+          if (isServiceActiveOnDate(svcId, day)) {
+            if (!seenTripIds.has(tId)) {
+              seenTripIds.add(tId);
               const rDisp = routeIdToShortNameMap[st.route_id] || routeIdToShortNameMap[st.route_id?.split('-')[0]] || parseRouteDisplay(st.route_id);
-              const startTime = tripStartTimeMap[st.trip_id] || tripStartTimeMap[extractBaseTripId(st.trip_id)] || 'Scheduled';
-              const orig = tripOriginMap[st.trip_id] || tripOriginMap[extractBaseTripId(st.trip_id)] || '';
-              const dest = st.headsign || tripDestinationMap[st.trip_id] || `Route ${rDisp}`;
+              const startTime = tripStartTimeMap[tId] || tripStartTimeMap[baseId] || 'Scheduled';
+              const orig = tripOriginMap[tId] || tripOriginMap[baseId] || '';
+              const dest = st.headsign || tripDestinationMap[tId] || `Route ${rDisp}`;
               
-              const delaySec = isToday ? delaysByTrip[st.trip_id] : undefined;
+              const delaySec = isToday ? delaysByTrip[tId] : undefined;
               const tardiness = formatTardiness(delaySec);
 
               blockExpandedRows.push({
@@ -789,7 +796,7 @@ app.get('/api/history/vehicle-day/:vehicleId', (req, res) => {
                 day: day,
                 start_time: startTime,
                 tardiness: tardiness,
-                trip_id: st.trip_id
+                trip_id: tId
               });
             }
           }
@@ -809,7 +816,14 @@ app.get('/api/history/vehicle-day/:vehicleId', (req, res) => {
         }
       });
 
-      let finalRows = Array.from(uniqueMap.values());
+      let finalRows = Array.from(uniqueMap.values()).filter(r => {
+        const startMins = timeStrToMinutes(r.start_time);
+        if (isToday && currentHour < 5 && startMins >= 720 && r.tardiness !== 'Scheduled') {
+          return false;
+        }
+        return true;
+      });
+
       finalRows.sort((a, b) => timeStrToMinutes(a.start_time) - timeStrToMinutes(b.start_time));
 
       const cleaned = finalRows.map(r => ({
@@ -833,7 +847,6 @@ app.get('/api/history/route/:routeDisplay', (req, res) => {
   const altRouteDisplay = routeDisplay.replace(/^0+/, '');
   const todayStr = getNZDateStr();
   const day = req.query.day || todayStr;
-  const prevDay = getPreviousDateStr(day);
   const isToday = (day === todayStr);
 
   db.all(
@@ -850,13 +863,11 @@ app.get('/api/history/route/:routeDisplay', (req, res) => {
       const staticTrips = routeDisplayToTripsMap[routeDisplay] || routeDisplayToTripsMap[altRouteDisplay] || [];
       
       staticTrips.forEach(st => {
-        const serviceActive = st.is_overnight 
-          ? isServiceActiveOnDate(st.service_id, prevDay)
-          : isServiceActiveOnDate(st.service_id, day);
+        const tId = st.trip_id;
+        const baseId = extractBaseTripId(tId);
+        const svcId = st.service_id || tripServiceMap[tId] || tripServiceMap[baseId];
 
-        if (serviceActive) {
-          const tId = st.trip_id;
-          const baseId = extractBaseTripId(tId);
+        if (isServiceActiveOnDate(svcId, day)) {
           if (!seenTripIds.has(tId) && !seenTripIds.has(baseId)) {
             seenTripIds.add(tId);
 
@@ -919,13 +930,12 @@ app.get('/api/history/route-days/:routeDisplay', (req, res) => {
         daysSet.add(getNZDateStr(d));
       }
 
-const sortedDays = Array.from(daysSet).sort().reverse();
+      const sortedDays = Array.from(daysSet).sort().reverse();
       res.json(sortedDays);
     }
   );
 });
 
-// Admin GTFS Refresh Endpoint
 app.get('/api/admin/refresh-gtfs', async (req, res) => {
   try {
     const dirPath = path.join(__dirname, 'gtfs-static');
@@ -943,7 +953,6 @@ app.get('/api/admin/refresh-gtfs', async (req, res) => {
   }
 });
 
-// Bug Report Endpoint
 app.post('/api/report-bug', async (req, res) => {
   try {
     const { userText, currentRoute, vehicleId } = req.body;
