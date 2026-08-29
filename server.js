@@ -90,7 +90,7 @@ async function migrateToCompositeUniqueness() {
   }
 }
 
-// Database Initialization with proper async sequencing to avoid migration race conditions
+// Database Initialization with proper async sequencing
 db.serialize(() => {
   db.run("PRAGMA journal_mode = WAL;");
   db.run("PRAGMA synchronous = NORMAL;");
@@ -113,7 +113,6 @@ db.serialize(() => {
       console.error('[DB] Initial table creation error:', err.message);
       return;
     }
-    // Add origin column if upgrading from legacy schema that lacked it
     db.run(`ALTER TABLE shift_history ADD COLUMN origin TEXT`, () => {});
     
     await migrateToCompositeUniqueness();
@@ -163,7 +162,11 @@ function cleanHeadsign(raw) {
 
 function parseRouteDisplay(routeId) {
   if (!routeId) return 'NIS';
-  const clean = String(routeId).split('-')[0].replace(/^0+/, '');
+  let clean = String(routeId).split('-')[0].replace(/^0+/, '');
+  // Clean 5-digit variant route IDs (e.g., 16201 -> 162, 92602 -> 926)
+  if (/^\d{5}$/.test(clean)) {
+    clean = clean.substring(0, 3);
+  }
   return clean || 'NIS';
 }
 
@@ -215,28 +218,46 @@ function timeStrToMinutes(timeStr) {
   return hours * 60 + minutes;
 }
 
+// Quote-safe CSV parser to prevent comma-containing stop names from throwing off column indices
+function parseCsvLine(line) {
+  const result = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') { inQuotes = !inQuotes; }
+    else if (c === ',' && !inQuotes) {
+      result.push(current.replace(/^"|"$/g, '').trim());
+      current = '';
+    } else {
+      current += c;
+    }
+  }
+  result.push(current.replace(/^"|"$/g, '').trim());
+  return result;
+}
+
 function isServiceActiveOnDate(serviceId, dateStr) {
   if (!serviceId) return true;
   const cleanDate = dateStr.replace(/-/g, '');
-  const parts = dateStr.split('-').map(Number);
-  if (parts.length !== 3) return true;
-
-  const d = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2]));
-  const dayOfWeek = d.getUTCDay(); 
-  const dayKeys = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
-  const dayKey = dayKeys[dayOfWeek];
 
   if (calendarExceptions[serviceId] && calendarExceptions[serviceId][cleanDate] !== undefined) {
-    return calendarExceptions[serviceId][cleanDate] === 1; 
+    return calendarExceptions[serviceId][cleanDate] === 1;
   }
 
   const cal = calendarServices[serviceId];
-  if (!cal) return true;
+  if (!cal) {
+    // If only defined in calendar_dates and today wasn't explicitly added above, mark inactive
+    return !calendarExceptions[serviceId];
+  }
 
-  const inRange = (cleanDate >= cal.start_date && cleanDate <= cal.end_date);
-  if (!inRange) return false;
+  const parts = dateStr.split('-').map(Number);
+  if (parts.length !== 3) return true;
+  const d = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2]));
+  const dayKeys = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+  const dayKey = dayKeys[d.getUTCDay()];
 
-  return cal[dayKey] === '1';
+  return (cleanDate >= cal.start_date && cleanDate <= cal.end_date) && cal[dayKey] === '1';
 }
 
 async function loadOrFetchGtfsData() {
@@ -373,12 +394,12 @@ async function loadOrFetchGtfsData() {
         });
       }
 
-      // Fast line-by-line parsing for stop_times.txt to prevent memory heap exhaustion
+      // Quote-safe line-by-line parsing for stop_times.txt
       const stopTimesEntry = zip.getEntry('stop_times.txt');
       if (stopTimesEntry) {
         const lines = stopTimesEntry.getData().toString('utf8').split(/\r?\n/);
         if (lines.length > 0) {
-          const header = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+          const header = parseCsvLine(lines[0]);
           const tripIdIdx = header.indexOf('trip_id');
           const seqIdx = header.indexOf('stop_sequence');
           const depTimeIdx = header.indexOf('departure_time');
@@ -386,7 +407,7 @@ async function loadOrFetchGtfsData() {
 
           for (let i = 1; i < lines.length; i++) {
             if (!lines[i]) continue;
-            const cols = lines[i].split(',').map(c => c.trim().replace(/^"|"$/g, ''));
+            const cols = parseCsvLine(lines[i]);
             const tId = cols[tripIdIdx];
             const seq = parseInt(cols[seqIdx], 10);
             const depTime = cols[depTimeIdx];
@@ -677,7 +698,6 @@ app.get('/api/stops/:id/departures', (req, res) => {
   res.json(departures);
 });
 
-// Increased LIMIT from 50 to 300 to retain complete multi-day history
 app.get('/api/history/bus/:vehicleId', (req, res) => {
   const vId = req.params.vehicleId.trim().toUpperCase();
   db.all(
@@ -711,7 +731,13 @@ app.get('/api/history/vehicle-day/:vehicleId', (req, res) => {
 
       rows.forEach(r => {
         if (r.trip_id) {
-          const bId = tripToBlockMap[r.trip_id] || tripToBlockMap[extractBaseTripId(r.trip_id)];
+          const rawId = String(r.trip_id).trim();
+          const baseId = extractBaseTripId(rawId);
+          
+          const bId = tripToBlockMap[rawId] 
+                   || tripToBlockMap[baseId] 
+                   || tripToBlockMap[rawId.split('-')[0]];
+                   
           if (bId) blockIdsToFetch.add(bId);
         }
       });
