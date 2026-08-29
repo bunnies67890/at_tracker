@@ -625,33 +625,37 @@ app.get('/api/buses/live', async (req, res) => {
       };
     }).filter(Boolean);
 
-    db.serialize(() => {
-      db.run("BEGIN TRANSACTION;");
-      const stmt = db.prepare(`
-        INSERT INTO shift_history (vehicle_id, trip_id, route_display, origin, destination, day, start_time, tardiness)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(trip_id, day) DO UPDATE SET
-          vehicle_id = excluded.vehicle_id,
-          route_display = excluded.route_display,
-          origin = excluded.origin,
-          destination = excluded.destination,
-          start_time = excluded.start_time,
-          tardiness = excluded.tardiness
-      `);
+db.serialize(() => {
+  db.run("BEGIN TRANSACTION;");
+  const stmt = db.prepare(`
+    INSERT INTO shift_history (vehicle_id, trip_id, route_display, origin, destination, day, start_time, tardiness)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(trip_id, day) DO UPDATE SET
+      vehicle_id = excluded.vehicle_id,
+      route_display = excluded.route_display,
+      origin = excluded.origin,
+      destination = excluded.destination,
+      start_time = excluded.start_time,
+      tardiness = excluded.tardiness
+  `);
 
-      liveBuses.forEach((b) => {
-        if (b.route_display !== 'NIS') {
-          stmt.run([b.vehicle_id, b.trip_id, b.route_display, b.origin, b.destination, todayStr, b.start_time, b.tardiness], (err) => {
-            if (err) console.error('[DB] shift_history upsert failed:', err.message);
-          });
-        }
-      });
+  liveBuses.forEach((b) => {
+    if (b.route_display !== 'NIS') {
+      const isOvernight = tripIsOvernightMap[b.trip_id] || tripIsOvernightMap[extractBaseTripId(b.trip_id)];
+      const nowAklHour = new Date(new Date().toLocaleString("en-US", { timeZone: "Pacific/Auckland" })).getHours();
+      
+      // Assign pings past midnight on overnight runs to yesterday's GTFS service day
+      const serviceDay = (isOvernight && nowAklHour < 5) ? getPreviousDateStr(todayStr) : todayStr;
 
-      stmt.finalize();
-      db.run("COMMIT;", (err) => {
-        if (err) console.error('[DB] COMMIT failed:', err.message);
+      stmt.run([b.vehicle_id, b.trip_id, b.route_display, b.origin, b.destination, serviceDay, b.start_time, b.tardiness], (err) => {
+        if (err) console.error('[DB] shift_history upsert failed:', err.message);
       });
-    });
+    }
+  });
+
+  stmt.finalize();
+  db.run("COMMIT;");
+});
 
     res.json(liveBuses);
   } catch (err) {
@@ -905,12 +909,13 @@ app.get('/api/history/route-days/:routeDisplay', (req, res) => {
         daysSet.add(getNZDateStr(d));
       }
 
-      const sortedDays = Array.from(daysSet).sort().reverse();
+const sortedDays = Array.from(daysSet).sort().reverse();
       res.json(sortedDays);
     }
   );
 });
 
+// Admin GTFS Refresh Endpoint
 app.get('/api/admin/refresh-gtfs', async (req, res) => {
   try {
     const dirPath = path.join(__dirname, 'gtfs-static');
