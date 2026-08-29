@@ -243,26 +243,29 @@ function parseCsvLine(line) {
 }
 
 function isServiceActiveOnDate(serviceId, dateStr) {
-  if (!serviceId) return true;
+  if (!serviceId || !dateStr) return false;
   const cleanDate = dateStr.replace(/-/g, '');
 
+  // 1. Explicit calendar_dates exception check (1 = Added service, 2 = Removed service)
   if (calendarExceptions[serviceId] && calendarExceptions[serviceId][cleanDate] !== undefined) {
     return calendarExceptions[serviceId][cleanDate] === 1;
   }
 
+  // 2. Regular calendar.txt weekly service check
   const cal = calendarServices[serviceId];
-  if (!cal) {
-    // If only defined in calendar_dates and today wasn't explicitly added above, mark inactive
-    return !calendarExceptions[serviceId];
-  }
+  if (!cal) return false;
 
   const parts = dateStr.split('-').map(Number);
-  if (parts.length !== 3) return true;
+  if (parts.length !== 3) return false;
+
   const d = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2]));
   const dayKeys = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
   const dayKey = dayKeys[d.getUTCDay()];
 
-  return (cleanDate >= cal.start_date && cleanDate <= cal.end_date) && cal[dayKey] === '1';
+  const inDateRange = cleanDate >= cal.start_date && cleanDate <= cal.end_date;
+  const operatesOnDay = String(cal[dayKey]).trim() === '1';
+
+  return inDateRange && operatesOnDay;
 }
 
 async function loadOrFetchGtfsData() {
@@ -625,37 +628,44 @@ app.get('/api/buses/live', async (req, res) => {
       };
     }).filter(Boolean);
 
-db.serialize(() => {
-  db.run("BEGIN TRANSACTION;");
-  const stmt = db.prepare(`
-    INSERT INTO shift_history (vehicle_id, trip_id, route_display, origin, destination, day, start_time, tardiness)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(trip_id, day) DO UPDATE SET
-      vehicle_id = excluded.vehicle_id,
-      route_display = excluded.route_display,
-      origin = excluded.origin,
-      destination = excluded.destination,
-      start_time = excluded.start_time,
-      tardiness = excluded.tardiness
-  `);
+    db.serialize(() => {
+      db.run("BEGIN TRANSACTION;");
+      const stmt = db.prepare(`
+        INSERT INTO shift_history (vehicle_id, trip_id, route_display, origin, destination, day, start_time, tardiness)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(trip_id, day) DO UPDATE SET
+          vehicle_id = excluded.vehicle_id,
+          route_display = excluded.route_display,
+          origin = excluded.origin,
+          destination = excluded.destination,
+          start_time = excluded.start_time,
+          tardiness = excluded.tardiness
+      `);
 
-  liveBuses.forEach((b) => {
-    if (b.route_display !== 'NIS') {
-      const isOvernight = tripIsOvernightMap[b.trip_id] || tripIsOvernightMap[extractBaseTripId(b.trip_id)];
       const nowAklHour = new Date(new Date().toLocaleString("en-US", { timeZone: "Pacific/Auckland" })).getHours();
-      
-      // Assign pings past midnight on overnight runs to yesterday's GTFS service day
-      const serviceDay = (isOvernight && nowAklHour < 5) ? getPreviousDateStr(todayStr) : todayStr;
 
-      stmt.run([b.vehicle_id, b.trip_id, b.route_display, b.origin, b.destination, serviceDay, b.start_time, b.tardiness], (err) => {
-        if (err) console.error('[DB] shift_history upsert failed:', err.message);
+      liveBuses.forEach((b) => {
+        if (b.route_display !== 'NIS') {
+          const startMins = timeStrToMinutes(b.start_time);
+          
+          // If pinged between 00:00 AM and 04:59 AM for a trip starting 6:00 PM or later,
+          // save under YESTERDAY'S GTFS service date instead of today's calendar date.
+          let targetDay = todayStr;
+          if (nowAklHour < 5 && startMins >= 1080) {
+            targetDay = getPreviousDateStr(todayStr);
+          }
+
+          stmt.run([b.vehicle_id, b.trip_id, b.route_display, b.origin, b.destination, targetDay, b.start_time, b.tardiness], (err) => {
+            if (err) console.error('[DB] shift_history upsert failed:', err.message);
+          });
+        }
       });
-    }
-  });
 
-  stmt.finalize();
-  db.run("COMMIT;");
-});
+      stmt.finalize();
+      db.run("COMMIT;", (err) => {
+        if (err) console.error('[DB] COMMIT failed:', err.message);
+      });
+    });
 
     res.json(liveBuses);
   } catch (err) {
