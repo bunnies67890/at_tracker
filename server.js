@@ -928,6 +928,15 @@ app.get('/api/history/route/:routeDisplay', (req, res) => {
       });
 
       let finalRows = Array.from(uniqueMap.values());
+
+      // Filter out future trips if checking today
+      if (isToday) {
+        const nowAkl = new Date(new Date().toLocaleString("en-US", { timeZone: "Pacific/Auckland" }));
+        const currentMins = nowAkl.getHours() * 60 + nowAkl.getMinutes();
+        
+        finalRows = finalRows.filter(r => timeStrToMinutes(r.start_time) <= currentMins);
+      }
+
       finalRows.sort((a, b) => timeStrToMinutes(b.start_time) - timeStrToMinutes(a.start_time));
 
       res.json(finalRows);
