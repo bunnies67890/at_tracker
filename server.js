@@ -148,7 +148,7 @@ db.serialize(() => {
 });
 
 function purgeOldHistory() {
-  const d = new Date(Date.now() - 6 * 24 * 60 * 60 * 1000); 
+  const d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000); 
   const cutoffDate = d.toLocaleDateString('en-CA', { timeZone: 'Pacific/Auckland' });
 
   db.run(`DELETE FROM shift_history WHERE day < ?`, [cutoffDate], (err) => {
