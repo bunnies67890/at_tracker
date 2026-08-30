@@ -1,56 +1,213 @@
+require('dotenv').config();
+
 const express = require('express');
-const fs = require('fs');
+const app = express();
 const path = require('path');
+const fs = require('fs');
+const AdmZip = require('adm-zip');
+const { parse } = require('csv-parse/sync');
 const sqlite3 = require('sqlite3').verbose();
 
-const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Database setup
-const dbPath = path.join(__dirname, 'tracker.db');
-const db = new sqlite3.Database(dbPath);
+const AT_API_KEY = process.env.AT_API_KEY;
+console.log('DEBUG CHECK:', AT_API_KEY ? `Key exists (${AT_API_KEY.length} chars)` : 'KEY IS BLANK OR UNDEFINED');
 
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS shift_history (
-    vehicle_id TEXT,
-    trip_id TEXT,
-    route_display TEXT,
-    origin TEXT,
-    destination TEXT,
-    day TEXT,
-    start_time TEXT,
-    tardiness TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (vehicle_id, day, start_time)
-  )`);
+function getDiscordWebhookUrl() {
+  return process.env.DISCORD_WEBHOOK_URL ? process.env.DISCORD_WEBHOOK_URL.trim() : '';
+}
+
+const dbPath = process.env.RAILWAY_VOLUME_MOUNT_PATH 
+  ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'bus_history.db') 
+  : path.join(__dirname, 'bus_history.db');
+
+const db = new sqlite3.Database(dbPath, (err) => {
+  if (err) console.error('Database connection error:', err.message);
 });
 
-// Global state maps
-let calendarServices = {};
-let calendarExceptions = {};
-let tripServiceMap = {};
-let stopDeparturesMap = {};
-let routeScheduledTripsMap = {};
-let tripIsOvernightMap = {};
-let delaysByTrip = {};
+function dbGet(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => (err ? reject(err) : resolve(row)));
+  });
+}
 
-// --- HELPER FUNCTIONS ---
+function dbRun(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function (err) { err ? reject(err) : resolve(this); });
+  });
+}
 
 function getNZDateStr(date = new Date()) {
-  return new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Pacific/Auckland',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit'
-  }).format(date);
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Pacific/Auckland' }).format(date);
 }
 
 function getPreviousDateStr(dateStr) {
+  if (!dateStr) return dateStr;
   const parts = dateStr.split('-').map(Number);
-  const d = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2]));
-  d.setUTCDate(d.getUTCDate() - 1);
+  if (parts.length !== 3) return dateStr;
+  const d = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2] - 1));
   return d.toISOString().split('T')[0];
+}
+
+async function migrateToCompositeUniqueness() {
+  const tableInfo = await dbGet(
+    `SELECT sql FROM sqlite_master WHERE type='table' AND name='shift_history'`
+  );
+
+  if (!tableInfo) return;
+
+  const hasOldConstraint = /trip_id\s+TEXT\s+UNIQUE/i.test(tableInfo.sql);
+  if (!hasOldConstraint) {
+    console.log('[DB migration] Schema already up to date.');
+    return;
+  }
+
+  console.log('[DB migration] Old single-column UNIQUE(trip_id) detected - migrating to UNIQUE(trip_id, day)...');
+  try {
+    await dbRun(`
+      CREATE TABLE shift_history_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        vehicle_id TEXT,
+        trip_id TEXT,
+        route_display TEXT,
+        origin TEXT,
+        destination TEXT,
+        day TEXT,
+        start_time TEXT,
+        tardiness TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await dbRun(`
+      INSERT INTO shift_history_new (vehicle_id, trip_id, route_display, origin, destination, day, start_time, tardiness, created_at)
+      SELECT vehicle_id, trip_id, route_display, origin, destination, day, start_time, tardiness, created_at
+      FROM shift_history
+    `);
+    await dbRun(`DROP TABLE shift_history`);
+    await dbRun(`ALTER TABLE shift_history_new RENAME TO shift_history`);
+    await dbRun(`CREATE UNIQUE INDEX IF NOT EXISTS idx_shift_history_trip_day ON shift_history(trip_id, day)`);
+    console.log('[DB migration] Done - existing history preserved.');
+  } catch (e) {
+    console.error('[DB migration] FAILED:', e.message);
+  }
+}
+
+db.serialize(() => {
+  db.run("PRAGMA journal_mode = WAL;");
+  db.run("PRAGMA synchronous = NORMAL;");
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS shift_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      vehicle_id TEXT,
+      trip_id TEXT,
+      route_display TEXT,
+      origin TEXT,
+      destination TEXT,
+      day TEXT,
+      start_time TEXT,
+      tardiness TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `, async (err) => {
+    if (err) {
+      console.error('[DB] Initial table creation error:', err.message);
+      return;
+    }
+    db.run(`ALTER TABLE shift_history ADD COLUMN origin TEXT`, () => {});
+    
+    await migrateToCompositeUniqueness();
+
+    db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_shift_history_trip_day ON shift_history(trip_id, day)`, (idxErr) => {
+      if (idxErr) console.error('[DB] Could not create composite unique index:', idxErr.message);
+    });
+
+    // Cleanup mis-tagged duplicate PM trips saved under next morning's date
+    db.run(`
+      DELETE FROM shift_history 
+      WHERE id IN (
+        SELECT h2.id 
+        FROM shift_history h1
+        JOIN shift_history h2 ON h1.trip_id = h2.trip_id 
+        WHERE h2.day > h1.day 
+          AND (h2.start_time LIKE '%PM%' OR CAST(SUBSTR(h2.start_time, 1, INSTR(h2.start_time, ':') - 1) AS INT) >= 6)
+      )
+    `);
+  });
+});
+
+function purgeOldHistory() {
+  const d = new Date(Date.now() - 6 * 24 * 60 * 60 * 1000); 
+  const cutoffDate = d.toLocaleDateString('en-CA', { timeZone: 'Pacific/Auckland' });
+
+  db.run(`DELETE FROM shift_history WHERE day < ?`, [cutoffDate], (err) => {
+    if (err) console.error('[DB] Error purging old history:', err.message);
+    else console.log(`[DB] Purged history prior to ${cutoffDate}`);
+  });
+}
+
+purgeOldHistory();
+setInterval(purgeOldHistory, 1000 * 60 * 60 * 6);
+
+let tripOriginMap = {};
+let tripDestinationMap = {};
+let routeIdToShortNameMap = {};
+let delaysByTrip = {};
+
+let tripToBlockMap = {};
+let blockToTripsMap = {};
+let tripStartTimeMap = {};
+let tripServiceMap = {};
+let tripIsOvernightMap = {};
+let calendarServices = {}; 
+let calendarExceptions = {}; 
+let routeDisplayToTripsMap = {};
+
+let allStops = [];
+let stopNamesMap = {};
+let stopDeparturesMap = {};
+
+function cleanHeadsign(raw) {
+  if (!raw) return '';
+  let s = String(raw).trim();
+  return s.replace(/^route\s*\w+\s*:?\s*/i, '').trim();
+}
+
+function parseRouteDisplay(routeId) {
+  if (!routeId) return 'NIS';
+  let clean = String(routeId).split('-')[0].replace(/^0+/, '');
+  if (/^\d{5}$/.test(clean)) {
+    clean = clean.substring(0, 3);
+  }
+  return clean || 'NIS';
+}
+
+function extractBaseTripId(rawTripId) {
+  if (!rawTripId) return '';
+  return String(rawTripId).trim().split('-')[0];
+}
+
+function formatTripTime(timeStr) {
+  if (!timeStr) return '';
+  const parts = String(timeStr).split(':');
+  if (parts.length >= 2) {
+    let hour = parseInt(parts[0], 10);
+    const min = parts[1].padStart(2, '0');
+    hour = hour % 24;
+    const ampm = hour >= 12 ? 'PM' : 'AM';
+    hour = hour % 12 || 12;
+    return `${hour}:${min} ${ampm}`;
+  }
+  return String(timeStr);
+}
+
+function timeStrToSeconds(timeStr) {
+  if (!timeStr) return 0;
+  const parts = String(timeStr).split(':');
+  if (parts.length < 2) return 0;
+  const hours = parseInt(parts[0], 10);
+  return hours * 3600 + parseInt(parts[1], 10) * 60 + parseInt(parts[2] || 0, 10);
 }
 
 function timeStrToMinutes(timeStr) {
@@ -60,7 +217,7 @@ function timeStrToMinutes(timeStr) {
     const parts = s.split(/[\sT]/);
     s = parts[parts.length - 1];
   }
-  const match = s.match(/^(\d{1,3}):(\d{2})(?::\d{2})?\s*(AM|PM)?$/i);
+  const match = s.match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?$/i);
   if (!match) return 0;
   let hours = parseInt(match[1], 10);
   const minutes = parseInt(match[2], 10);
@@ -68,41 +225,32 @@ function timeStrToMinutes(timeStr) {
   if (ampm) {
     if (ampm === 'PM' && hours < 12) hours += 12;
     if (ampm === 'AM' && hours === 12) hours = 0;
-  }
-  if (hours < 5 && (!ampm || ampm === 'AM')) {
-    hours += 24;
+  } else {
+    hours = hours % 24;
   }
   return hours * 60 + minutes;
 }
 
-function extractBaseTripId(tripId) {
-  if (!tripId) return '';
-  return tripId.split('_')[0];
-}
-
-function formatCleanDestination(destination) {
-  let cleanDest = String(destination || '').trim();
-  cleanDest = cleanDest.replace(/^route\s*\w+\s*:?\s*/i, '').trim();
-
-  const parts = cleanDest.split(/\s+to\s+/i);
-  if (parts.length > 1) {
-    cleanDest = parts.slice(1).join(' to ');
-  } else {
-    cleanDest = cleanDest.replace(/^to\s+/i, '').trim();
+function parseCsvLine(line) {
+  const result = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') { inQuotes = !inQuotes; }
+    else if (c === ',' && !inQuotes) {
+      result.push(current.replace(/^"|"$/g, '').trim());
+      current = '';
+    } else {
+      current += c;
+    }
   }
-  return cleanDest;
-}
-
-function formatTripTime(timeStr) {
-  if (!timeStr) return '';
-  const parts = timeStr.split(':');
-  if (parts.length < 2) return timeStr;
-  let h = parseInt(parts[0], 10) % 24;
-  return `${String(h).padStart(2, '0')}:${parts[1]}`;
+  result.push(current.replace(/^"|"$/g, '').trim());
+  return result;
 }
 
 function isServiceActiveOnDate(serviceId, dateStr) {
-  if (!serviceId || !dateStr) return true;
+  if (!serviceId || !dateStr) return false;
   const cleanDate = dateStr.replace(/-/g, '');
 
   if (calendarExceptions[serviceId] && calendarExceptions[serviceId][cleanDate] !== undefined) {
@@ -110,10 +258,10 @@ function isServiceActiveOnDate(serviceId, dateStr) {
   }
 
   const cal = calendarServices[serviceId];
-  if (!cal) return true;
+  if (!cal) return false;
 
   const parts = dateStr.split('-').map(Number);
-  if (parts.length !== 3) return true;
+  if (parts.length !== 3) return false;
 
   const d = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2]));
   const dayKeys = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
@@ -125,44 +273,459 @@ function isServiceActiveOnDate(serviceId, dateStr) {
   return inDateRange && operatesOnDay;
 }
 
-function getDiscordWebhookUrl() {
-  return process.env.DISCORD_WEBHOOK_URL || '';
-}
-
 async function loadOrFetchGtfsData() {
-  console.log('[GTFS] Loading static GTFS data...');
+  const dirPath = path.join(__dirname, 'gtfs-static');
+  const zipPath = path.join(dirPath, 'gtfs.zip');
+
+  if (!fs.existsSync(dirPath)) fs.mkdirSync(dirPath, { recursive: true });
+
+  if (fs.existsSync(zipPath)) {
+    const stats = fs.statSync(zipPath);
+    if (stats.size < 50000) fs.unlinkSync(zipPath);
+  }
+
+  if (!fs.existsSync(zipPath)) {
+    try {
+      const res = await fetch('https://gtfs.at.govt.nz/gtfs.zip');
+      if (res.ok) {
+        const buffer = await res.arrayBuffer();
+        fs.writeFileSync(zipPath, Buffer.from(buffer));
+      }
+    } catch (e) {
+      console.error('[GTFS] Download failed:', e.message);
+    }
+  }
+
+  if (fs.existsSync(zipPath)) {
+    try {
+      const zip = new AdmZip(zipPath);
+      allStops = [];
+      stopNamesMap = {};
+      routeDisplayToTripsMap = {};
+      tripIsOvernightMap = {};
+
+      const stopsEntry = zip.getEntry('stops.txt');
+      if (stopsEntry) {
+        const stopRows = parse(stopsEntry.getData().toString('utf8'), { columns: true, skip_empty_lines: true, trim: true });
+        stopRows.forEach((s) => {
+          if (s.stop_id && s.stop_name) {
+            const sId = s.stop_id.trim();
+            const sName = s.stop_name.trim();
+            stopNamesMap[sId] = sName;
+            allStops.push({
+              stop_id: sId,
+              stop_name: sName,
+              lat: parseFloat(s.stop_lat),
+              lon: parseFloat(s.stop_lon)
+            });
+          }
+        });
+      }
+
+      const routesEntry = zip.getEntry('routes.txt');
+      if (routesEntry) {
+        const routeRows = parse(routesEntry.getData().toString('utf8'), { columns: true, skip_empty_lines: true, trim: true });
+        routeRows.forEach((r) => {
+          if (r.route_id && r.route_short_name) {
+            routeIdToShortNameMap[r.route_id.trim()] = r.route_short_name.trim();
+            routeIdToShortNameMap[r.route_id.trim().split('-')[0]] = r.route_short_name.trim();
+          }
+        });
+      }
+
+      const calEntry = zip.getEntry('calendar.txt');
+      if (calEntry) {
+        const calRows = parse(calEntry.getData().toString('utf8'), { columns: true, skip_empty_lines: true, trim: true });
+        calRows.forEach(c => {
+          if (c.service_id) {
+            calendarServices[c.service_id.trim()] = {
+              monday: c.monday, tuesday: c.tuesday, wednesday: c.wednesday,
+              thursday: c.thursday, friday: c.friday, saturday: c.saturday, sunday: c.sunday,
+              start_date: c.start_date.trim(), end_date: c.end_date.trim()
+            };
+          }
+        });
+      }
+
+      const calExEntry = zip.getEntry('calendar_dates.txt');
+      if (calExEntry) {
+        const exRows = parse(calExEntry.getData().toString('utf8'), { columns: true, skip_empty_lines: true, trim: true });
+        exRows.forEach(ex => {
+          const sId = ex.service_id?.trim();
+          const dt = ex.date?.trim();
+          const type = parseInt(ex.exception_type, 10);
+          if (sId && dt) {
+            if (!calendarExceptions[sId]) calendarExceptions[sId] = {};
+            calendarExceptions[sId][dt] = type;
+          }
+        });
+      }
+
+      const tripMinSeqTime = {};
+      const tripMinStopName = {};
+      const tripMaxStopName = {};
+      
+      const tripsEntry = zip.getEntry('trips.txt');
+      const tripMetaMap = {};
+      if (tripsEntry) {
+        const tripRows = parse(tripsEntry.getData().toString('utf8'), { columns: true, skip_empty_lines: true, trim: true });
+        tripRows.forEach((t) => {
+          const tId = t.trip_id?.trim();
+          if (!tId) return;
+          const baseId = extractBaseTripId(tId);
+          const serviceId = t.service_id?.trim();
+          const blockId = t.block_id?.trim();
+          const routeId = t.route_id?.trim();
+          const routeDisplay = routeIdToShortNameMap[routeId] || routeIdToShortNameMap[routeId?.split('-')[0]] || parseRouteDisplay(routeId);
+
+          if (serviceId) {
+            tripServiceMap[tId] = serviceId;
+            tripServiceMap[baseId] = serviceId;
+          }
+
+          if (blockId) {
+            tripToBlockMap[tId] = blockId;
+            tripToBlockMap[baseId] = blockId;
+
+            if (!blockToTripsMap[blockId]) blockToTripsMap[blockId] = [];
+            blockToTripsMap[blockId].push({
+              trip_id: tId,
+              route_id: routeId,
+              service_id: serviceId,
+              headsign: cleanHeadsign(t.trip_headsign)
+            });
+          }
+
+          let headsign = cleanHeadsign(t.trip_headsign);
+          if (headsign) {
+            tripDestinationMap[tId] = headsign;
+            tripDestinationMap[baseId] = headsign;
+          }
+
+          tripMetaMap[tId] = { route: routeDisplay, destination: headsign, service_id: serviceId };
+          tripMetaMap[baseId] = tripMetaMap[tId];
+        });
+      }
+
+      const stopTimesEntry = zip.getEntry('stop_times.txt');
+      if (stopTimesEntry) {
+        const lines = stopTimesEntry.getData().toString('utf8').split(/\r?\n/);
+        if (lines.length > 0) {
+          const header = parseCsvLine(lines[0]);
+          const tripIdIdx = header.indexOf('trip_id');
+          const seqIdx = header.indexOf('stop_sequence');
+          const depTimeIdx = header.indexOf('departure_time');
+          const stopIdIdx = header.indexOf('stop_id');
+
+          for (let i = 1; i < lines.length; i++) {
+            if (!lines[i]) continue;
+            const cols = parseCsvLine(lines[i]);
+            const tId = cols[tripIdIdx];
+            const seq = parseInt(cols[seqIdx], 10);
+            const depTime = cols[depTimeIdx];
+            const sId = cols[stopIdIdx];
+
+            if (tId && depTime) {
+              const hour = parseInt(depTime.split(':')[0], 10);
+              if (!isNaN(hour) && hour >= 24) {
+                tripIsOvernightMap[tId] = true;
+                tripIsOvernightMap[extractBaseTripId(tId)] = true;
+              }
+            }
+
+            if (tId && !isNaN(seq)) {
+              if (depTime && (!tripMinSeqTime[tId] || seq < tripMinSeqTime[tId].seq)) {
+                tripMinSeqTime[tId] = { seq, time: depTime };
+              }
+              if (sId && stopNamesMap[sId]) {
+                if (!tripMinStopName[tId] || seq < tripMinStopName[tId].seq) {
+                  tripMinStopName[tId] = { seq, name: stopNamesMap[sId] };
+                }
+                if (!tripMaxStopName[tId] || seq > tripMaxStopName[tId].seq) {
+                  tripMaxStopName[tId] = { seq, name: stopNamesMap[sId] };
+                }
+              }
+            }
+
+            if (tId && sId && depTime) {
+              const meta = tripMetaMap[tId] || tripMetaMap[extractBaseTripId(tId)] || { route: 'N/A', destination: 'N/A' };
+              const originName = tripMinStopName[tId]?.name || '';
+              const destName = meta.destination || tripMaxStopName[tId]?.name || 'N/A';
+
+              if (!stopDeparturesMap[sId]) stopDeparturesMap[sId] = [];
+              stopDeparturesMap[sId].push({
+                trip_id: tId,
+                route: meta.route,
+                origin: originName,
+                destination: destName,
+                timeStr: depTime
+              });
+            }
+          }
+        }
+      }
+
+      for (const tId in tripMinSeqTime) {
+        const formatted = formatTripTime(tripMinSeqTime[tId].time);
+        tripStartTimeMap[tId] = formatted;
+        tripStartTimeMap[extractBaseTripId(tId)] = formatted;
+      }
+
+      for (const tId in tripMinStopName) {
+        const origName = cleanHeadsign(tripMinStopName[tId].name);
+        if (origName) {
+          tripOriginMap[tId] = origName;
+          tripOriginMap[extractBaseTripId(tId)] = origName;
+        }
+      }
+
+      for (const tId in tripMaxStopName) {
+        const destName = cleanHeadsign(tripMaxStopName[tId].name);
+        if (destName && !tripDestinationMap[tId]) {
+          tripDestinationMap[tId] = destName;
+          tripDestinationMap[extractBaseTripId(tId)] = destName;
+        }
+      }
+
+      for (const tId in tripMetaMap) {
+        const meta = tripMetaMap[tId];
+        const rDisp = meta.route;
+        if (!rDisp || rDisp === 'NIS') continue;
+        const upperRDisp = String(rDisp).trim().toUpperCase();
+        
+        if (!routeDisplayToTripsMap[upperRDisp]) routeDisplayToTripsMap[upperRDisp] = [];
+
+        const startTime = tripStartTimeMap[tId] || 'Scheduled';
+        const orig = tripOriginMap[tId] || '';
+        const dest = meta.destination || tripDestinationMap[tId] || `Route ${rDisp}`;
+        const serviceId = meta.service_id;
+
+        routeDisplayToTripsMap[upperRDisp].push({
+          trip_id: tId,
+          route_display: upperRDisp,
+          service_id: serviceId,
+          origin: orig,
+          destination: dest,
+          start_time: startTime
+        });
+      }
+    } catch (e) {
+      console.error('[GTFS Static] Error:', e.message);
+    }
+  }
 }
 
-loadOrFetchGtfsData().catch(err => console.error('[GTFS Error]', err));
+loadOrFetchGtfsData();
 
+async function updateTripUpdates() {
+  try {
+    const res = await fetch('https://api.at.govt.nz/realtime/legacy/tripupdates', {
+      headers: { 'Ocp-Apim-Subscription-Key': AT_API_KEY }
+    });
+    if (!res.ok) return;
 
-// --- API ENDPOINTS ---
+    const json = await res.json();
+    const entities = json.response?.entity || json.entity || [];
+    const next = {};
+
+    entities.forEach((entity) => {
+      const tu = entity.trip_update;
+      const tripId = tu?.trip?.trip_id;
+      if (!tripId) return;
+
+      let tripDelay = tu.delay;
+      let stopTimeUpdates = tu.stop_time_update;
+      if (!Array.isArray(stopTimeUpdates) && stopTimeUpdates) stopTimeUpdates = [stopTimeUpdates];
+
+      if (tripDelay === undefined && stopTimeUpdates && stopTimeUpdates.length > 0) {
+        for (const stu of stopTimeUpdates) {
+          const d = stu.arrival?.delay ?? stu.departure?.delay;
+          if (d !== undefined && d !== null) { tripDelay = d; break; }
+        }
+      }
+      if (tripDelay !== undefined && tripDelay !== null) next[tripId] = tripDelay;
+    });
+    delaysByTrip = next;
+  } catch (e) {}
+}
+
+updateTripUpdates();
+setInterval(updateTripUpdates, 20000);
+
+function extractFleetNumber(vehicleEntity) {
+  if (!vehicleEntity) return 'Unknown';
+  let raw = String(vehicleEntity.label || vehicleEntity.id || '').trim();
+  return raw.toUpperCase() || 'Unknown';
+}
+
+function formatOccupancy(status) {
+  const map = { 0: 'Empty', 1: 'Many Seats Available', 2: 'Few Seats Available', 3: 'Standing Room Only', 4: 'Crushed Standing Room', 5: 'Bus Full', 6: 'Not Accepting Passengers' };
+  return map[status] || 'Seats Available';
+}
+
+function formatTardiness(delaySeconds) {
+  if (delaySeconds === null || delaySeconds === undefined || isNaN(delaySeconds)) return 'Scheduled';
+  const mins = Math.round(delaySeconds / 60);
+  if (mins > 0) return `+${mins} min late`;
+  if (mins < 0) return `${Math.abs(mins)} min early`;
+  return 'On Time';
+}
+
+function getActualTripStartTime(v, timestampSec) {
+  if (v?.trip?.start_time) return formatTripTime(v.trip.start_time);
+  const tripId = String(v?.trip?.trip_id || '');
+  if (tripStartTimeMap[tripId]) return tripStartTimeMap[tripId];
+  const baseId = extractBaseTripId(tripId);
+  if (tripStartTimeMap[baseId]) return tripStartTimeMap[baseId];
+
+  const match = tripId.match(/-(\d{2})(\d{2})(\d{2})$/);
+  if (match) return formatTripTime(`${match[1]}:${match[2]}:${match[3]}`);
+  if (timestampSec) {
+    const d = new Date(timestampSec * 1000);
+    return d.toLocaleTimeString('en-NZ', { timeZone: 'Pacific/Auckland', hour: '2-digit', minute: '2-digit' });
+  }
+  return new Date().toLocaleTimeString('en-NZ', { timeZone: 'Pacific/Auckland', hour: '2-digit', minute: '2-digit' });
+}
+
+app.get('/api/buses/live', async (req, res) => {
+  try {
+    const url = `https://api.at.govt.nz/realtime/legacy/vehiclelocations?subscription-key=${AT_API_KEY}`;
+    const response = await fetch(url, { headers: { 'Ocp-Apim-Subscription-Key': AT_API_KEY, 'Accept': 'application/json' } });
+
+    if (!response.ok) return res.status(response.status).json({ error: `AT API HTTP ${response.status}` });
+
+    const data = await response.json();
+    const entities = data.response?.entity || data.entity || [];
+    const todayStr = getNZDateStr();
+
+    const liveBuses = entities.map((e) => {
+      const v = e.vehicle;
+      if (!v || !v.position || !v.position.latitude || !v.position.longitude) return null;
+
+      const vehicleId = extractFleetNumber(v.vehicle);
+      const routeRaw = v.trip?.route_id || v.trip?.routeId || '';
+      const routeDisplay = routeIdToShortNameMap[routeRaw] || routeIdToShortNameMap[String(routeRaw).split('-')[0]] || parseRouteDisplay(routeRaw);
+
+      const startTimeFormatted = getActualTripStartTime(v, v.timestamp || e.timestamp);
+      const tripId = v.trip?.trip_id || `trip_${vehicleId}_${routeDisplay}`;
+      const baseTripId = extractBaseTripId(tripId);
+
+      let finalOrigin = tripOriginMap[tripId] || tripOriginMap[baseTripId] || '';
+      let finalDest = tripDestinationMap[tripId] || tripDestinationMap[baseTripId] || cleanHeadsign(v.trip?.trip_headsign) || (routeDisplay === 'NIS' ? 'Not In Service' : `Route ${routeDisplay}`);
+
+      const delaySec = v.trip?.delay ?? v.delay ?? delaysByTrip[tripId];
+      const finalStatus = formatTardiness(delaySec);
+
+      return {
+        vehicle_id: vehicleId,
+        trip_id: tripId,
+        route_display: routeDisplay,
+        start_time: startTimeFormatted,
+        origin: finalOrigin,
+        destination: finalDest,
+        latitude: parseFloat(v.position.latitude),
+        longitude: parseFloat(v.position.longitude),
+        tardiness: finalStatus,
+        occupancy: formatOccupancy(v.occupancy_status)
+      };
+    }).filter(Boolean);
+
+    db.serialize(() => {
+      db.run("BEGIN TRANSACTION;");
+      const stmt = db.prepare(`
+        INSERT INTO shift_history (vehicle_id, trip_id, route_display, origin, destination, day, start_time, tardiness)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(trip_id, day) DO UPDATE SET
+          vehicle_id = excluded.vehicle_id,
+          route_display = excluded.route_display,
+          origin = excluded.origin,
+          destination = excluded.destination,
+          start_time = excluded.start_time,
+          tardiness = excluded.tardiness
+      `);
+
+      const nowAklHour = new Date(new Date().toLocaleString("en-US", { timeZone: "Pacific/Auckland" })).getHours();
+
+      liveBuses.forEach((b) => {
+        if (b.route_display !== 'NIS') {
+          const startMins = timeStrToMinutes(b.start_time);
+          const baseId = extractBaseTripId(b.trip_id);
+          const isOvernightTrip = tripIsOvernightMap[b.trip_id] || tripIsOvernightMap[baseId];
+
+          let targetDay = todayStr;
+          
+          if (nowAklHour < 5 && (startMins >= 720 || isOvernightTrip)) {
+            targetDay = getPreviousDateStr(todayStr);
+          }
+
+          stmt.run([b.vehicle_id, b.trip_id, b.route_display, b.origin, b.destination, targetDay, b.start_time, b.tardiness], (err) => {
+            if (err) console.error('[DB] shift_history upsert failed:', err.message);
+          });
+        }
+      });
+
+      stmt.finalize();
+      db.run("COMMIT;", (err) => {
+        if (err) console.error('[DB] COMMIT failed:', err.message);
+      });
+    });
+
+    res.json(liveBuses);
+  } catch (err) {
+    res.status(500).json({ error: 'Server Catch Error', details: err.message });
+  }
+});
+
+app.get('/api/stops', (req, res) => {
+  res.json(allStops);
+});
 
 app.get('/api/stops/:id/departures', (req, res) => {
   const stopId = req.params.id.trim();
   const rawDeps = stopDeparturesMap[stopId] || [];
 
   const nowAkl = new Date(new Date().toLocaleString("en-US", { timeZone: "Pacific/Auckland" }));
-  const nowHour = nowAkl.getHours();
-  const currentMinutes = (nowHour < 5 ? nowHour + 24 : nowHour) * 60 + nowAkl.getMinutes();
+  const currentHour = nowAkl.getHours();
+  const currentSeconds = currentHour * 3600 + nowAkl.getMinutes() * 60 + nowAkl.getSeconds();
+  
   const todayStr = getNZDateStr();
+  const yesterdayStr = getPreviousDateStr(todayStr);
 
+  const seenKeys = new Set();
   const upcoming = [];
 
   for (const d of rawDeps) {
     const serviceId = tripServiceMap[d.trip_id] || tripServiceMap[extractBaseTripId(d.trip_id)];
-    const tripMins = timeStrToMinutes(d.timeStr);
+    let rawSeconds = timeStrToSeconds(d.timeStr);
+    
+    let activeDate = todayStr;
+    let compareSeconds = rawSeconds;
 
-    if (serviceId && !isServiceActiveOnDate(serviceId, todayStr)) {
+    if (rawSeconds >= 86400) {
+      activeDate = yesterdayStr;
+      if (currentHour < 5) {
+        compareSeconds = rawSeconds - 86400;
+      }
+    } else if (currentHour < 5 && rawSeconds < 18000) {
+      activeDate = yesterdayStr;
+    }
+
+    if (serviceId && !isServiceActiveOnDate(serviceId, activeDate)) {
       continue;
     }
 
-    if (tripMins < currentMinutes) continue;
+    if (activeDate === todayStr && compareSeconds < currentSeconds) continue;
+    if (activeDate === yesterdayStr && currentHour >= 5) continue;
+    if (activeDate === yesterdayStr && currentHour < 5 && compareSeconds < currentSeconds) continue;
 
-    upcoming.push({ ...d, tripMins });
+    const dedupKey = `${d.route}_${d.origin}_${d.destination}_${d.timeStr}`;
+    if (seenKeys.has(dedupKey)) continue;
+    seenKeys.add(dedupKey);
+
+    upcoming.push({ ...d, compareSeconds });
   }
 
-  upcoming.sort((a, b) => a.tripMins - b.tripMins);
+  upcoming.sort((a, b) => a.compareSeconds - b.compareSeconds);
 
   const departures = upcoming.map(d => ({
     route: d.route,
@@ -175,118 +738,191 @@ app.get('/api/stops/:id/departures', (req, res) => {
   res.json(departures);
 });
 
-app.post('/api/buses/live', (req, res) => {
-  const liveBuses = req.body.buses || [];
-  const todayStr = getNZDateStr();
-  const yesterdayStr = getPreviousDateStr(todayStr);
-  const nowAklHour = new Date(new Date().toLocaleString("en-US", { timeZone: "Pacific/Auckland" })).getHours();
-
-  const stmt = db.prepare(`INSERT OR REPLACE INTO shift_history 
-    (vehicle_id, trip_id, route_display, origin, destination, day, start_time, tardiness) 
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
-
-  liveBuses.forEach((b) => {
-    if (b.route_display && b.route_display !== 'NIS') {
-      const startMins = timeStrToMinutes(b.start_time);
-      let targetDay = todayStr;
-
-      // Early morning window (00:00 - 04:59 NZ time): map early shifts to yesterday's service day
-      if (nowAklHour < 5) {
-        if (startMins < 300 || startMins >= 1440) {
-          targetDay = yesterdayStr;
-        }
-      }
-
-      stmt.run([
-        String(b.vehicle_id),
-        b.trip_id || '',
-        b.route_display,
-        b.origin || '',
-        b.destination || '',
-        targetDay,
-        b.start_time || '',
-        b.tardiness || 'On Time'
-      ], (err) => {
-        if (err) console.error('[DB] shift_history upsert failed:', err.message);
-      });
-    }
-  });
-
-  stmt.finalize();
-  res.json({ success: true, count: liveBuses.length });
-});
-
 app.get('/api/history/bus/:vehicleId', (req, res) => {
-  const vehicleId = (req.params.vehicleId || '').trim();
-
+  const vId = req.params.vehicleId.trim().toUpperCase();
   db.all(
-    `SELECT * FROM shift_history 
-     WHERE vehicle_id = ? 
-     ORDER BY day DESC, start_time DESC`,
-    [vehicleId],
+    `SELECT vehicle_id, trip_id, route_display, origin, destination, day, start_time, tardiness FROM shift_history WHERE vehicle_id = ? ORDER BY id DESC LIMIT 300`,
+    [vId],
     (err, rows) => {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
+      if (err) return res.status(500).json([]);
       res.json(rows || []);
     }
   );
 });
 
-app.get('/api/history/route/:routeDisplay/:day', (req, res) => {
+app.get('/api/history/vehicle-day/:vehicleId', (req, res) => {
+  const vehicleId = req.params.vehicleId.trim().toUpperCase();
+  const todayStr = getNZDateStr();
+  const day = req.query.day || todayStr;
+  const isToday = (day === todayStr);
+
+  db.all(
+    `SELECT route_display, origin, destination, day, start_time, tardiness, trip_id 
+     FROM shift_history 
+     WHERE vehicle_id = ? AND day = ? 
+     ORDER BY start_time ASC`,
+    [vehicleId, day],
+    (err, rows) => {
+      if (err) rows = [];
+
+      const nowAkl = new Date(new Date().toLocaleString("en-US", { timeZone: "Pacific/Auckland" }));
+      const currentHour = nowAkl.getHours();
+
+      const validRows = rows.filter(r => {
+        const startMins = timeStrToMinutes(r.start_time);
+        if (isToday && currentHour < 5 && startMins >= 720 && r.tardiness !== 'Scheduled') {
+          return false;
+        }
+        return true;
+      });
+
+      const seenTripIds = new Set(validRows.map(r => r.trip_id));
+      let blockIdsToFetch = new Set();
+
+      validRows.forEach(r => {
+        if (r.trip_id) {
+          const rawId = String(r.trip_id).trim();
+          const baseId = extractBaseTripId(rawId);
+          
+          const bId = tripToBlockMap[rawId] 
+                   || tripToBlockMap[baseId] 
+                   || tripToBlockMap[rawId.split('-')[0]];
+                   
+          if (bId) blockIdsToFetch.add(bId);
+        }
+      });
+
+      let blockExpandedRows = [...validRows];
+
+      blockIdsToFetch.forEach(bId => {
+        const scheduledTrips = blockToTripsMap[bId] || [];
+        scheduledTrips.forEach(st => {
+          const tId = st.trip_id;
+          const baseId = extractBaseTripId(tId);
+          const svcId = st.service_id || tripServiceMap[tId] || tripServiceMap[baseId];
+
+          if (isServiceActiveOnDate(svcId, day)) {
+            if (!seenTripIds.has(tId)) {
+              seenTripIds.add(tId);
+              const rDisp = routeIdToShortNameMap[st.route_id] || routeIdToShortNameMap[st.route_id?.split('-')[0]] || parseRouteDisplay(st.route_id);
+              const startTime = tripStartTimeMap[tId] || tripStartTimeMap[baseId] || 'Scheduled';
+              const orig = tripOriginMap[tId] || tripOriginMap[baseId] || '';
+              const dest = st.headsign || tripDestinationMap[tId] || `Route ${rDisp}`;
+              
+              const delaySec = isToday ? delaysByTrip[tId] : undefined;
+              const tardiness = formatTardiness(delaySec);
+
+              blockExpandedRows.push({
+                route_display: rDisp,
+                origin: orig,
+                destination: dest,
+                day: day,
+                start_time: startTime,
+                tardiness: tardiness,
+                trip_id: tId
+              });
+            }
+          }
+        });
+      });
+
+      const uniqueMap = new Map();
+      blockExpandedRows.forEach(r => {
+        const key = `${r.route_display}_${r.start_time}`;
+        if (!uniqueMap.has(key)) {
+          uniqueMap.set(key, r);
+        } else {
+          const existing = uniqueMap.get(key);
+          if (r.tardiness !== 'Scheduled' && existing.tardiness === 'Scheduled') {
+            uniqueMap.set(key, r);
+          }
+        }
+      });
+
+      let finalRows = Array.from(uniqueMap.values()).filter(r => {
+        const startMins = timeStrToMinutes(r.start_time);
+        if (isToday && currentHour < 5 && startMins >= 720 && r.tardiness !== 'Scheduled') {
+          return false;
+        }
+        return true;
+      });
+
+      finalRows.sort((a, b) => timeStrToMinutes(a.start_time) - timeStrToMinutes(b.start_time));
+
+      const cleaned = finalRows.map(r => ({
+        route_display: r.route_display,
+        origin: r.origin,
+        destination: r.destination,
+        day: r.day,
+        start_time: r.start_time,
+        tardiness: r.tardiness,
+        trip_id: r.trip_id
+      }));
+
+      res.json(cleaned);
+    }
+  );
+});
+
+app.get('/api/history/route/:routeDisplay', (req, res) => {
   const rawRoute = req.params.routeDisplay || '';
   const routeDisplay = rawRoute.trim().toUpperCase();
   const altRouteDisplay = routeDisplay.replace(/^0+/, '');
-  const day = req.params.day;
+  const todayStr = getNZDateStr();
+  const day = req.query.day || todayStr;
+  const isToday = (day === todayStr);
 
   db.all(
-    `SELECT * FROM shift_history 
+    `SELECT vehicle_id, trip_id, route_display, origin, destination, day, start_time, tardiness, created_at 
+     FROM shift_history 
      WHERE (route_display = ? OR route_display = ?) AND day = ?`,
     [routeDisplay, altRouteDisplay, day],
-    (err, dbRows) => {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
+    (err, rows) => {
+      if (err) rows = [];
 
-      const combinedRows = [...(dbRows || [])];
+      const seenTripIds = new Set(rows.map(r => r.trip_id).filter(Boolean));
+      let combinedRows = [...rows];
 
-      const scheduledTrips = routeScheduledTripsMap[routeDisplay] || routeScheduledTripsMap[altRouteDisplay] || [];
-      scheduledTrips.forEach(st => {
+      const staticTrips = routeDisplayToTripsMap[routeDisplay] || routeDisplayToTripsMap[altRouteDisplay] || [];
+      
+      staticTrips.forEach(st => {
         const tId = st.trip_id;
-        const serviceId = tripServiceMap[tId] || tripServiceMap[extractBaseTripId(tId)];
+        const baseId = extractBaseTripId(tId);
+        const svcId = st.service_id || tripServiceMap[tId] || tripServiceMap[baseId];
 
-        if (!serviceId || isServiceActiveOnDate(serviceId, day)) {
-          combinedRows.push({
-            vehicle_id: 'Scheduled',
-            trip_id: tId,
-            route_display: st.route_display || routeDisplay,
-            origin: st.origin,
-            destination: st.destination,
-            day: day,
-            start_time: st.start_time,
-            tardiness: 'Scheduled',
-            created_at: null
-          });
+        if (isServiceActiveOnDate(svcId, day)) {
+          if (!seenTripIds.has(tId) && !seenTripIds.has(baseId)) {
+            seenTripIds.add(tId);
+
+            const delaySec = isToday ? (delaysByTrip[tId] ?? delaysByTrip[baseId]) : undefined;
+            const tardiness = formatTardiness(delaySec);
+
+            combinedRows.push({
+              vehicle_id: 'Scheduled',
+              trip_id: tId,
+              route_display: st.route_display || routeDisplay,
+              origin: st.origin,
+              destination: st.destination,
+              day: day,
+              start_time: st.start_time,
+              tardiness: tardiness,
+              created_at: null
+            });
+          }
         }
       });
 
       const uniqueMap = new Map();
       combinedRows.forEach(r => {
-        const mins = timeStrToMinutes(r.start_time);
-        const normDest = formatCleanDestination(r.destination).toLowerCase();
-        const key = `${mins}_${normDest}`;
-
+        const cleanOrig = cleanHeadsign(r.origin);
+        const cleanDest = cleanHeadsign(r.destination);
+        const key = `${r.start_time}_${cleanOrig}_${cleanDest}`;
         if (!uniqueMap.has(key)) {
           uniqueMap.set(key, r);
         } else {
           const existing = uniqueMap.get(key);
           if (r.vehicle_id !== 'Scheduled' && existing.vehicle_id === 'Scheduled') {
             uniqueMap.set(key, r);
-          } else if (r.vehicle_id !== 'Scheduled' && existing.vehicle_id !== 'Scheduled') {
-            const subKey = `${key}_${r.vehicle_id}`;
-            if (!uniqueMap.has(subKey)) {
-              uniqueMap.set(subKey, r);
-            }
           }
         }
       });
@@ -310,10 +946,6 @@ app.get('/api/history/route-days/:routeDisplay', (req, res) => {
      ORDER BY day DESC`,
     [routeDisplay, altRouteDisplay],
     (err, rows) => {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-
       const daysSet = new Set((rows || []).map(r => r.day));
 
       const nowAkl = new Date(new Date().toLocaleString("en-US", { timeZone: "Pacific/Auckland" }));
@@ -337,9 +969,6 @@ app.get('/api/admin/refresh-gtfs', async (req, res) => {
     if (fs.existsSync(zipPath)) {
       fs.unlinkSync(zipPath);
     }
-
-    calendarServices = {};
-    calendarExceptions = {};
 
     await loadOrFetchGtfsData();
 
