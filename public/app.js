@@ -62,7 +62,10 @@ function parseTimeToMinutes(timeStr) {
   if (s.includes('T')) {
     const parsedDate = new Date(s);
     if (!isNaN(parsedDate.getTime())) {
-      return parsedDate.getHours() * 60 + parsedDate.getMinutes();
+      let h = parsedDate.getHours();
+      let m = parsedDate.getMinutes();
+      if (h < 5) h += 24;
+      return h * 60 + m;
     }
     s = s.split('T')[1];
   } else if (s.includes(' ') && s.includes('-')) {
@@ -70,7 +73,7 @@ function parseTimeToMinutes(timeStr) {
     s = parts[parts.length - 1];
   }
 
-  const match = s.match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?$/i);
+  const match = s.match(/^(\d{1,3}):(\d{2})(?::\d{2})?\s*(AM|PM)?$/i);
   if (!match) return 0;
   
   let hours = parseInt(match[1], 10);
@@ -80,8 +83,11 @@ function parseTimeToMinutes(timeStr) {
   if (ampm) {
     if (ampm === 'PM' && hours < 12) hours += 12;
     if (ampm === 'AM' && hours === 12) hours = 0;
-  } else {
-    if (hours >= 24) hours = hours % 24;
+  }
+
+  // Treat early morning hours (< 5 AM) as post-midnight (add 24 hours) for service-day alignment
+  if (hours < 5) {
+    hours += 24;
   }
 
   return hours * 60 + minutes;
@@ -108,19 +114,19 @@ function format12HourTime(rawTime) {
     s = parts[parts.length - 1];
   }
 
-  const match = s.match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?$/i);
+  const match = s.match(/^(\d{1,3}):(\d{2})(?::\d{2})?\s*(AM|PM)?$/i);
   if (!match) return s || 'N/A';
 
   let hours = parseInt(match[1], 10);
   const minutes = match[2];
   const ampm = match[3] ? match[3].toUpperCase() : null;
 
+  if (hours >= 24) hours = hours % 24;
+
   if (ampm) {
     if (hours === 0) hours = 12;
     return `${hours}:${minutes} ${ampm}`;
   }
-
-  if (hours >= 24) hours = hours % 24;
 
   const period = hours >= 12 ? 'PM' : 'AM';
   hours = hours % 12 || 12;
@@ -128,9 +134,16 @@ function format12HourTime(rawTime) {
   return `${hours}:${minutes} ${period}`;
 }
 
+function getNZCurrentMinutes() {
+  const now = new Date();
+  const nzTimeString = now.toLocaleTimeString('en-GB', { timeZone: 'Pacific/Auckland', hour: '2-digit', minute: '2-digit' });
+  const [h, m] = nzTimeString.split(':').map(Number);
+  return h < 5 ? (h + 24) * 60 + m : h * 60 + m;
+}
+
 function isEarlyMorningTrip(timeStr) {
   const mins = parseTimeToMinutes(timeStr);
-  return mins >= 0 && mins < 240;
+  return mins >= 1440 || (mins >= 0 && mins < 300);
 }
 
 function getShiftLocalDate(shift) {
@@ -168,19 +181,6 @@ function getShiftLocalDate(shift) {
   }
 
   return '';
-}
-
-function isTripOverdue(startTimeStr, selectedDay) {
-  const todayNZ = new Date().toLocaleDateString('en-CA', { timeZone: 'Pacific/Auckland' });
-  if (selectedDay !== todayNZ) return false;
-
-  const now = new Date();
-  const nzTimeString = now.toLocaleTimeString('en-GB', { timeZone: 'Pacific/Auckland', hour: '2-digit', minute: '2-digit' });
-  const [currentHours, currentMinutes] = nzTimeString.split(':').map(Number);
-  const nowInMinutes = currentHours * 60 + currentMinutes;
-
-  const tripMinutes = parseTimeToMinutes(startTimeStr);
-  return nowInMinutes > tripMinutes;
 }
 
 function processShiftTrips(shiftTrips, selectedDateStr) {
@@ -659,7 +659,7 @@ function renderFilteredRouteDepartures() {
   const now = new Date();
   const todayStr = toDateStr(now);
   const selectedDate = dateSelect ? dateSelect.value : todayStr;
-  const currentMinutes = now.getHours() * 60 + now.getMinutes();
+  const currentMinutes = getNZCurrentMinutes();
 
   const searchInput = document.getElementById('route-departure-search');
   const query = searchInput ? searchInput.value.toLowerCase().trim() : '';
@@ -669,12 +669,6 @@ function renderFilteredRouteDepartures() {
     const vId = getTripVehicleId(shift);
     
     if (!startTime && !vId) return false;
-
-    const shiftMinutes = parseTimeToMinutes(startTime);
-
-    if (selectedDate === todayStr && shiftMinutes > currentMinutes) {
-      return false;
-    }
 
     if (!query) return true;
     const formattedStartTime = format12HourTime(startTime).toLowerCase();
@@ -716,17 +710,6 @@ function renderFilteredRouteDepartures() {
     let tardinessDisplay = shift.tardiness || 'Scheduled';
     if (isScheduled || selectedDate > todayStr || (selectedDate === todayStr && shiftMinutes > currentMinutes)) {
       tardinessDisplay = 'Scheduled';
-    }
-
-    if (shiftMinutes === 0) {
-      const actualDate = new Date(selectedDate + 'T00:00:00');
-      actualDate.setDate(actualDate.getDate() + 1);
-
-      const dd = String(actualDate.getDate()).padStart(2, '0');
-      const mm = String(actualDate.getMonth() + 1).padStart(2, '0');
-      const yyyy = actualDate.getFullYear();
-
-      commencedTag = ` <span style="color: #666; font-weight: normal; font-size: 12px;">(commenced on ${dd}/${mm}/${yyyy})</span>`;
     }
 
     const isOverdue = isScheduled && (selectedDate === todayStr) && (shiftMinutes < currentMinutes);

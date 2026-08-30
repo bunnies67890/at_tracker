@@ -26,7 +26,7 @@ db.serialize(() => {
   )`);
 });
 
-// Global GTFS and state mappings
+// Global state maps
 let calendarServices = {};
 let calendarExceptions = {};
 let tripServiceMap = {};
@@ -69,16 +69,10 @@ function timeStrToMinutes(timeStr) {
     if (ampm === 'PM' && hours < 12) hours += 12;
     if (ampm === 'AM' && hours === 12) hours = 0;
   }
-  // Preserves hours >= 24 (e.g. 24:30 becomes 1470 minutes) without modulo wrapping
+  if (hours < 5 && (!ampm || ampm === 'AM')) {
+    hours += 24;
+  }
   return hours * 60 + minutes;
-}
-
-function timeStrToSeconds(timeStr) {
-  if (!timeStr) return 0;
-  const parts = String(timeStr).split(':');
-  if (parts.length < 2) return 0;
-  const hours = parseInt(parts[0], 10);
-  return hours * 3600 + parseInt(parts[1], 10) * 60 + parseInt(parts[2] || 0, 10);
 }
 
 function extractBaseTripId(tripId) {
@@ -86,15 +80,25 @@ function extractBaseTripId(tripId) {
   return tripId.split('_')[0];
 }
 
+function formatCleanDestination(destination) {
+  let cleanDest = String(destination || '').trim();
+  cleanDest = cleanDest.replace(/^route\s*\w+\s*:?\s*/i, '').trim();
+
+  const parts = cleanDest.split(/\s+to\s+/i);
+  if (parts.length > 1) {
+    cleanDest = parts.slice(1).join(' to ');
+  } else {
+    cleanDest = cleanDest.replace(/^to\s+/i, '').trim();
+  }
+  return cleanDest;
+}
+
 function formatTripTime(timeStr) {
   if (!timeStr) return '';
   const parts = timeStr.split(':');
   if (parts.length < 2) return timeStr;
-  let h = parseInt(parts[0], 10);
-  const m = parts[1];
-  if (h >= 24) h -= 24;
-  const hStr = String(h % 24).padStart(2, '0');
-  return `${hStr}:${m}`;
+  let h = parseInt(parts[0], 10) % 24;
+  return `${String(h).padStart(2, '0')}:${parts[1]}`;
 }
 
 function isServiceActiveOnDate(serviceId, dateStr) {
@@ -106,7 +110,7 @@ function isServiceActiveOnDate(serviceId, dateStr) {
   }
 
   const cal = calendarServices[serviceId];
-  if (!cal) return true; // Fallback to active if calendar mapping is absent
+  if (!cal) return true;
 
   const parts = dateStr.split('-').map(Number);
   if (parts.length !== 3) return true;
@@ -126,10 +130,9 @@ function getDiscordWebhookUrl() {
 }
 
 async function loadOrFetchGtfsData() {
-  console.log('[GTFS] Static feed checked and loaded.');
+  console.log('[GTFS] Loading static GTFS data...');
 }
 
-// Initial GTFS loader invocation
 loadOrFetchGtfsData().catch(err => console.error('[GTFS Error]', err));
 
 
@@ -140,52 +143,26 @@ app.get('/api/stops/:id/departures', (req, res) => {
   const rawDeps = stopDeparturesMap[stopId] || [];
 
   const nowAkl = new Date(new Date().toLocaleString("en-US", { timeZone: "Pacific/Auckland" }));
-  const currentHour = nowAkl.getHours();
-  const currentMinutes = currentHour * 60 + nowAkl.getMinutes();
-  
+  const nowHour = nowAkl.getHours();
+  const currentMinutes = (nowHour < 5 ? nowHour + 24 : nowHour) * 60 + nowAkl.getMinutes();
   const todayStr = getNZDateStr();
-  const yesterdayStr = getPreviousDateStr(todayStr);
 
-  const seenKeys = new Set();
   const upcoming = [];
 
   for (const d of rawDeps) {
     const serviceId = tripServiceMap[d.trip_id] || tripServiceMap[extractBaseTripId(d.trip_id)];
     const tripMins = timeStrToMinutes(d.timeStr);
-    
-    let activeDate = todayStr;
-    let compareMins = tripMins;
 
-    // Early morning window (12:00 AM - 5:00 AM) and post-midnight GTFS times (>= 24 hours / 1440 mins)
-    if (currentHour < 5) {
-      if (tripMins < 300) {
-        activeDate = yesterdayStr;
-      } else if (tripMins >= 1440) {
-        activeDate = yesterdayStr;
-        compareMins = tripMins - 1440;
-      }
-    } else {
-      if (tripMins >= 1440) {
-        compareMins = tripMins - 1440;
-      }
-    }
-
-    if (serviceId && !isServiceActiveOnDate(serviceId, activeDate)) {
+    if (serviceId && !isServiceActiveOnDate(serviceId, todayStr)) {
       continue;
     }
 
-    if (activeDate === todayStr && compareMins < currentMinutes) continue;
-    if (activeDate === yesterdayStr && currentHour >= 5) continue;
-    if (activeDate === yesterdayStr && currentHour < 5 && compareMins < currentMinutes) continue;
+    if (tripMins < currentMinutes) continue;
 
-    const dedupKey = `${d.route}_${d.origin}_${d.destination}_${d.timeStr}`;
-    if (seenKeys.has(dedupKey)) continue;
-    seenKeys.add(dedupKey);
-
-    upcoming.push({ ...d, compareMins });
+    upcoming.push({ ...d, tripMins });
   }
 
-  upcoming.sort((a, b) => a.compareMins - b.compareMins);
+  upcoming.sort((a, b) => a.tripMins - b.tripMins);
 
   const departures = upcoming.map(d => ({
     route: d.route,
@@ -209,24 +186,27 @@ app.post('/api/buses/live', (req, res) => {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
 
   liveBuses.forEach((b) => {
-    if (b.route_display !== 'NIS') {
+    if (b.route_display && b.route_display !== 'NIS') {
       const startMins = timeStrToMinutes(b.start_time);
-      const baseId = extractBaseTripId(b.trip_id);
-      const serviceId = tripServiceMap[b.trip_id] || tripServiceMap[baseId];
-      const isOvernightTrip = tripIsOvernightMap[b.trip_id] || tripIsOvernightMap[baseId];
-
       let targetDay = todayStr;
 
+      // Early morning window (00:00 - 04:59 NZ time): map early shifts to yesterday's service day
       if (nowAklHour < 5) {
-        const activeYesterday = isServiceActiveOnDate(serviceId, yesterdayStr);
-        const activeToday = isServiceActiveOnDate(serviceId, todayStr);
-
-        if ((activeYesterday && !activeToday) || isOvernightTrip || startMins < 300 || startMins >= 720) {
+        if (startMins < 300 || startMins >= 1440) {
           targetDay = yesterdayStr;
         }
       }
 
-      stmt.run([b.vehicle_id, b.trip_id, b.route_display, b.origin, b.destination, targetDay, b.start_time, b.tardiness], (err) => {
+      stmt.run([
+        String(b.vehicle_id),
+        b.trip_id || '',
+        b.route_display,
+        b.origin || '',
+        b.destination || '',
+        targetDay,
+        b.start_time || '',
+        b.tardiness || 'On Time'
+      ], (err) => {
         if (err) console.error('[DB] shift_history upsert failed:', err.message);
       });
     }
@@ -234,6 +214,23 @@ app.post('/api/buses/live', (req, res) => {
 
   stmt.finalize();
   res.json({ success: true, count: liveBuses.length });
+});
+
+app.get('/api/history/bus/:vehicleId', (req, res) => {
+  const vehicleId = (req.params.vehicleId || '').trim();
+
+  db.all(
+    `SELECT * FROM shift_history 
+     WHERE vehicle_id = ? 
+     ORDER BY day DESC, start_time DESC`,
+    [vehicleId],
+    (err, rows) => {
+      if (err) {
+        return res.status(500).json({ error: err.message });
+      }
+      res.json(rows || []);
+    }
+  );
 });
 
 app.get('/api/history/route/:routeDisplay/:day', (req, res) => {
@@ -257,9 +254,8 @@ app.get('/api/history/route/:routeDisplay/:day', (req, res) => {
       scheduledTrips.forEach(st => {
         const tId = st.trip_id;
         const serviceId = tripServiceMap[tId] || tripServiceMap[extractBaseTripId(tId)];
-        
+
         if (!serviceId || isServiceActiveOnDate(serviceId, day)) {
-          const tardiness = 'Scheduled';
           combinedRows.push({
             vehicle_id: 'Scheduled',
             trip_id: tId,
@@ -268,7 +264,7 @@ app.get('/api/history/route/:routeDisplay/:day', (req, res) => {
             destination: st.destination,
             day: day,
             start_time: st.start_time,
-            tardiness: tardiness,
+            tardiness: 'Scheduled',
             created_at: null
           });
         }
@@ -276,13 +272,21 @@ app.get('/api/history/route/:routeDisplay/:day', (req, res) => {
 
       const uniqueMap = new Map();
       combinedRows.forEach(r => {
-        const key = `${r.start_time}_${r.origin}_${r.destination}`;
+        const mins = timeStrToMinutes(r.start_time);
+        const normDest = formatCleanDestination(r.destination).toLowerCase();
+        const key = `${mins}_${normDest}`;
+
         if (!uniqueMap.has(key)) {
           uniqueMap.set(key, r);
         } else {
           const existing = uniqueMap.get(key);
           if (r.vehicle_id !== 'Scheduled' && existing.vehicle_id === 'Scheduled') {
             uniqueMap.set(key, r);
+          } else if (r.vehicle_id !== 'Scheduled' && existing.vehicle_id !== 'Scheduled') {
+            const subKey = `${key}_${r.vehicle_id}`;
+            if (!uniqueMap.has(subKey)) {
+              uniqueMap.set(subKey, r);
+            }
           }
         }
       });
