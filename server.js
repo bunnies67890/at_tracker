@@ -50,6 +50,17 @@ function getPreviousDateStr(dateStr) {
   return d.toISOString().split('T')[0];
 }
 
+function getTripServiceDate(v, fallbackTodayStr) {
+  const rawDate = v?.trip?.start_date || v?.trip?.startDate;
+  if (rawDate && /^\d{8}$/.test(rawDate)) {
+    return `${rawDate.substring(0, 4)}-${rawDate.substring(4, 6)}-${rawDate.substring(6, 8)}`;
+  }
+  if (rawDate && /^\d{4}-\d{2}-\d{2}$/.test(rawDate)) {
+    return rawDate;
+  }
+  return fallbackTodayStr;
+}
+
 async function migrateToCompositeUniqueness() {
   const tableInfo = await dbGet(
     `SELECT sql FROM sqlite_master WHERE type='table' AND name='shift_history'`
@@ -123,7 +134,6 @@ db.serialize(() => {
       if (idxErr) console.error('[DB] Could not create composite unique index:', idxErr.message);
     });
 
-    // Cleanup mis-tagged duplicate PM trips saved under next morning's date
     db.run(`
       DELETE FROM shift_history 
       WHERE id IN (
@@ -626,7 +636,8 @@ app.get('/api/buses/live', async (req, res) => {
         latitude: parseFloat(v.position.latitude),
         longitude: parseFloat(v.position.longitude),
         tardiness: finalStatus,
-        occupancy: formatOccupancy(v.occupancy_status)
+        occupancy: formatOccupancy(v.occupancy_status),
+        raw_vehicle_obj: v
       };
     }).filter(Boolean);
 
@@ -644,19 +655,9 @@ app.get('/api/buses/live', async (req, res) => {
           tardiness = excluded.tardiness
       `);
 
-      const nowAklHour = new Date(new Date().toLocaleString("en-US", { timeZone: "Pacific/Auckland" })).getHours();
-
       liveBuses.forEach((b) => {
         if (b.route_display !== 'NIS') {
-          const startMins = timeStrToMinutes(b.start_time);
-          const baseId = extractBaseTripId(b.trip_id);
-          const isOvernightTrip = tripIsOvernightMap[b.trip_id] || tripIsOvernightMap[baseId];
-
-          let targetDay = todayStr;
-          
-          if (nowAklHour < 5 && (startMins >= 720 || isOvernightTrip)) {
-            targetDay = getPreviousDateStr(todayStr);
-          }
+          const targetDay = getTripServiceDate(b.raw_vehicle_obj, todayStr);
 
           stmt.run([b.vehicle_id, b.trip_id, b.route_display, b.origin, b.destination, targetDay, b.start_time, b.tardiness], (err) => {
             if (err) console.error('[DB] shift_history upsert failed:', err.message);
@@ -929,7 +930,6 @@ app.get('/api/history/route/:routeDisplay', (req, res) => {
 
       let finalRows = Array.from(uniqueMap.values());
 
-      // Filter out future trips if checking today
       if (isToday) {
         const nowAkl = new Date(new Date().toLocaleString("en-US", { timeZone: "Pacific/Auckland" }));
         const currentMins = nowAkl.getHours() * 60 + nowAkl.getMinutes();
