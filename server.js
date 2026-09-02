@@ -1143,30 +1143,3 @@ function updateBusMarker(vehicleData) {
   }
 }
 
-let currentRouteLine = null;
-
-async function drawOfficialRouteLine(shapeIdOrRouteId) {
-  // Remove existing line if redrawing
-  if (currentRouteLine) {
-    map.removeLayer(currentRouteLine);
-  }
-
-  // Fetch official GTFS shape points or GeoJSON layer
-  const res = await fetch(`/api/routes/${shapeIdOrRouteId}/shape`);
-  const geojsonOrCoords = await res.json();
-
-  // If receiving standard GeoJSON from AT Open GIS:
-  currentRouteLine = L.geoJSON(geojsonOrCoords, {
-    style: {
-      color: '#0072CE',
-      weight: 5,
-      opacity: 0.8
-    }
-  }).addTo(map);
-
-  // If receiving raw GTFS shape point arrays [[lat, lon], [lat, lon]]:
-  // currentRouteLine = L.polyline(geojsonOrCoords, { color: '#0072CE', weight: 5 }).addTo(map);
-
-  // Fit map view to the route extent if desired
-  map.fitBounds(currentRouteLine.getBounds());
-}
