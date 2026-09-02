@@ -8,7 +8,6 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   attribution: '© OpenStreetMap contributors'
 }).addTo(map);
 
-// Prevent Leaflet from intercepting clicks/scrolls on UI overlays
 const searchWrapper = document.querySelector('.search-wrapper');
 if (searchWrapper) {
   L.DomEvent.disableClickPropagation(searchWrapper);
@@ -85,7 +84,6 @@ function parseTimeToMinutes(timeStr) {
     if (ampm === 'AM' && hours === 12) hours = 0;
   }
 
-  // Treat early morning hours (< 5 AM) as post-midnight (add 24 hours) for service-day alignment
   if (hours < 5) {
     hours += 24;
   }
@@ -886,4 +884,4 @@ window.addEventListener('click', (event) => {
 });
 
 fetchAndRenderBuses();
-setInterval(fetchAndRenderBuses, 15000);
+setInterval(fetchAndRenderBuses, 20000);

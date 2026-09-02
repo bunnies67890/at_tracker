@@ -104,11 +104,11 @@ async function migrateToCompositeUniqueness() {
   }
 }
 
-db.serialize(() => {
-  db.run("PRAGMA journal_mode = WAL;");
-  db.run("PRAGMA synchronous = NORMAL;");
+async function initDatabase() {
+  await dbRun("PRAGMA journal_mode = WAL;");
+  await dbRun("PRAGMA synchronous = NORMAL;");
 
-  db.run(`
+  await dbRun(`
     CREATE TABLE IF NOT EXISTS shift_history (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       vehicle_id TEXT,
@@ -121,31 +121,29 @@ db.serialize(() => {
       tardiness TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
-  `, async (err) => {
-    if (err) {
-      console.error('[DB] Initial table creation error:', err.message);
-      return;
-    }
-    db.run(`ALTER TABLE shift_history ADD COLUMN origin TEXT`, () => {});
-    
-    await migrateToCompositeUniqueness();
+  `);
 
-    db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_shift_history_trip_day ON shift_history(trip_id, day)`, (idxErr) => {
-      if (idxErr) console.error('[DB] Could not create composite unique index:', idxErr.message);
-    });
+  try {
+    await dbRun(`ALTER TABLE shift_history ADD COLUMN origin TEXT`);
+  } catch (e) {}
 
-    db.run(`
-      DELETE FROM shift_history 
-      WHERE id IN (
-        SELECT h2.id 
-        FROM shift_history h1
-        JOIN shift_history h2 ON h1.trip_id = h2.trip_id 
-        WHERE h2.day > h1.day 
-          AND (h2.start_time LIKE '%PM%' OR CAST(SUBSTR(h2.start_time, 1, INSTR(h2.start_time, ':') - 1) AS INT) >= 6)
-      )
-    `);
-  });
-});
+  await migrateToCompositeUniqueness();
+
+  await dbRun(`CREATE UNIQUE INDEX IF NOT EXISTS idx_shift_history_trip_day ON shift_history(trip_id, day)`);
+
+  await dbRun(`
+    DELETE FROM shift_history 
+    WHERE id IN (
+      SELECT h2.id 
+      FROM shift_history h1
+      JOIN shift_history h2 ON h1.trip_id = h2.trip_id 
+      WHERE h2.day > h1.day 
+        AND (h2.start_time LIKE '%PM%' OR CAST(SUBSTR(h2.start_time, 1, INSTR(h2.start_time, ':') - 1) AS INT) >= 6)
+    )
+  `);
+}
+
+initDatabase().catch(err => console.error('[DB Init Error]', err));
 
 function purgeOldHistory() {
   const d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000); 
@@ -177,6 +175,8 @@ let routeDisplayToTripsMap = {};
 let allStops = [];
 let stopNamesMap = {};
 let stopDeparturesMap = {};
+
+let cachedLiveBuses = [];
 
 function cleanHeadsign(raw) {
   if (!raw) return '';
@@ -528,6 +528,7 @@ async function loadOrFetchGtfsData() {
 loadOrFetchGtfsData();
 
 async function updateTripUpdates() {
+  if (!AT_API_KEY) return;
   try {
     const res = await fetch('https://api.at.govt.nz/realtime/legacy/tripupdates', {
       headers: { 'Ocp-Apim-Subscription-Key': AT_API_KEY }
@@ -540,7 +541,7 @@ async function updateTripUpdates() {
 
     entities.forEach((entity) => {
       const tu = entity.trip_update;
-      const tripId = tu?.trip?.trip_id;
+      const tripId = tu?.trip?.trip_id || tu?.trip?.tripId;
       if (!tripId) return;
 
       let tripDelay = tu.delay;
@@ -582,8 +583,9 @@ function formatTardiness(delaySeconds) {
 }
 
 function getActualTripStartTime(v, timestampSec) {
-  if (v?.trip?.start_time) return formatTripTime(v.trip.start_time);
-  const tripId = String(v?.trip?.trip_id || '');
+  const rawStartTime = v?.trip?.start_time || v?.trip?.startTime;
+  if (rawStartTime) return formatTripTime(rawStartTime);
+  const tripId = String(v?.trip?.trip_id || v?.trip?.tripId || '');
   if (tripStartTimeMap[tripId]) return tripStartTimeMap[tripId];
   const baseId = extractBaseTripId(tripId);
   if (tripStartTimeMap[baseId]) return tripStartTimeMap[baseId];
@@ -597,12 +599,16 @@ function getActualTripStartTime(v, timestampSec) {
   return new Date().toLocaleTimeString('en-NZ', { timeZone: 'Pacific/Auckland', hour: '2-digit', minute: '2-digit' });
 }
 
-app.get('/api/buses/live', async (req, res) => {
+async function fetchLiveBuses() {
+  if (!AT_API_KEY) return;
   try {
     const url = `https://api.at.govt.nz/realtime/legacy/vehiclelocations?subscription-key=${AT_API_KEY}`;
     const response = await fetch(url, { headers: { 'Ocp-Apim-Subscription-Key': AT_API_KEY, 'Accept': 'application/json' } });
 
-    if (!response.ok) return res.status(response.status).json({ error: `AT API HTTP ${response.status}` });
+    if (!response.ok) {
+      console.error(`[Background Bus Fetch Error] HTTP ${response.status}`);
+      return;
+    }
 
     const data = await response.json();
     const entities = data.response?.entity || data.entity || [];
@@ -617,13 +623,13 @@ app.get('/api/buses/live', async (req, res) => {
       const routeDisplay = routeIdToShortNameMap[routeRaw] || routeIdToShortNameMap[String(routeRaw).split('-')[0]] || parseRouteDisplay(routeRaw);
 
       const startTimeFormatted = getActualTripStartTime(v, v.timestamp || e.timestamp);
-      const tripId = v.trip?.trip_id || `trip_${vehicleId}_${routeDisplay}`;
+      const tripId = v.trip?.trip_id || v.trip?.tripId || `trip_${vehicleId}_${routeDisplay}_${startTimeFormatted}`;
       const baseTripId = extractBaseTripId(tripId);
 
       let finalOrigin = tripOriginMap[tripId] || tripOriginMap[baseTripId] || '';
       let finalDest = tripDestinationMap[tripId] || tripDestinationMap[baseTripId] || cleanHeadsign(v.trip?.trip_headsign) || (routeDisplay === 'NIS' ? 'Not In Service' : `Route ${routeDisplay}`);
 
-      const delaySec = v.trip?.delay ?? v.delay ?? delaysByTrip[tripId];
+      const delaySec = v.trip?.delay ?? v.delay ?? delaysByTrip[tripId] ?? delaysByTrip[baseTripId];
       const finalStatus = formatTardiness(delaySec);
 
       return {
@@ -641,6 +647,8 @@ app.get('/api/buses/live', async (req, res) => {
       };
     }).filter(Boolean);
 
+    cachedLiveBuses = liveBuses;
+
     db.serialize(() => {
       db.run("BEGIN TRANSACTION;");
       const stmt = db.prepare(`
@@ -656,7 +664,7 @@ app.get('/api/buses/live', async (req, res) => {
       `);
 
       liveBuses.forEach((b) => {
-        if (b.route_display !== 'NIS') {
+        if (b.route_display !== 'NIS' && b.trip_id) {
           const targetDay = getTripServiceDate(b.raw_vehicle_obj, todayStr);
 
           stmt.run([b.vehicle_id, b.trip_id, b.route_display, b.origin, b.destination, targetDay, b.start_time, b.tardiness], (err) => {
@@ -671,10 +679,16 @@ app.get('/api/buses/live', async (req, res) => {
       });
     });
 
-    res.json(liveBuses);
   } catch (err) {
-    res.status(500).json({ error: 'Server Catch Error', details: err.message });
+    console.error('[Background Bus Fetch Exception]', err.message);
   }
+}
+
+fetchLiveBuses();
+setInterval(fetchLiveBuses, 20000);
+
+app.get('/api/buses/live', (req, res) => {
+  res.json(cachedLiveBuses);
 });
 
 app.get('/api/stops', (req, res) => {
