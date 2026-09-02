@@ -1084,3 +1084,89 @@ server.on('error', (err) => {
     console.error(err);
   }
 });
+
+// Store bus stops in a map layer for easy toggling
+const stopLayerGroup = L.layerGroup().addTo(map);
+
+async function loadBusStops() {
+  // Replace with your stops endpoint or AT Open GIS GeoJSON url
+  const res = await fetch('/api/stops'); 
+  const stops = await res.json();
+
+  stops.forEach(stop => {
+    const marker = L.circleMarker([stop.stop_lat, stop.stop_lon], {
+      radius: 5,
+      color: '#005596',
+      fillColor: '#ffffff',
+      fillOpacity: 0.9,
+      weight: 2
+    });
+
+    // Handle stop click to fetch departures dynamically
+    marker.on('click', async () => {
+      marker.bindPopup('Loading upcoming departures...').openPopup();
+      
+      const depRes = await fetch(`/api/stops/${stop.stop_id}/departures`);
+      const departures = await depRes.json();
+      
+      let content = `<b>${stop.stop_name} (Stop ${stop.stop_code || stop.stop_id})</b><br><hr>`;
+      if (!departures.length) {
+        content += 'No upcoming departures.';
+      } else {
+        content += '<ul>' + departures.map(d => 
+          `<li><b>${d.route_short_name}</b> to ${d.headsign} - ${d.departure_time}</li>`
+        ).join('') + '</ul>';
+      }
+
+      marker.setPopupContent(content);
+    });
+
+    stopLayerGroup.addLayer(marker);
+  });
+}
+
+function updateBusMarker(vehicleData) {
+  const { vehicle_id, lat, lon, routeDisplay, next_stop_name, current_status } = vehicleData;
+
+  const popupText = `
+    <b>Route ${routeDisplay}</b><br>
+    <b>Status:</b> ${current_status || 'In Transit'}<br>
+    <b>Next Stop:</b> ${next_stop_name || 'Approaching stop...'}
+  `;
+
+  if (busMarkers[vehicle_id]) {
+    busMarkers[vehicle_id].setLatLng([lat, lon]).setPopupContent(popupText);
+  } else {
+    busMarkers[vehicle_id] = L.marker([lat, lon])
+      .bindPopup(popupText)
+      .addTo(map);
+  }
+}
+
+let currentRouteLine = null;
+
+async function drawOfficialRouteLine(shapeIdOrRouteId) {
+  // Remove existing line if redrawing
+  if (currentRouteLine) {
+    map.removeLayer(currentRouteLine);
+  }
+
+  // Fetch official GTFS shape points or GeoJSON layer
+  const res = await fetch(`/api/routes/${shapeIdOrRouteId}/shape`);
+  const geojsonOrCoords = await res.json();
+
+  // If receiving standard GeoJSON from AT Open GIS:
+  currentRouteLine = L.geoJSON(geojsonOrCoords, {
+    style: {
+      color: '#0072CE',
+      weight: 5,
+      opacity: 0.8
+    }
+  }).addTo(map);
+
+  // If receiving raw GTFS shape point arrays [[lat, lon], [lat, lon]]:
+  // currentRouteLine = L.polyline(geojsonOrCoords, { color: '#0072CE', weight: 5 }).addTo(map);
+
+  // Fit map view to the route extent if desired
+  map.fitBounds(currentRouteLine.getBounds());
+}
