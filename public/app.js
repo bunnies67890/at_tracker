@@ -21,7 +21,7 @@ if (searchDropdown) {
 }
 
 const KNOWN_EXPRESS_ROUTES = new Set([
-  'NX1', 'NX2', 'WX1', 'CTY', 'TMK', 'AIR', 'INN', 'OUT', 'STH', 'EAST', 'WEST', 'ONE', 'DEV', 'RANG', 'MTIA', 'HOBS', 'GULF', 'HMB', 'PINE', 'MTID', 'BAYS', 'BIRK', 'TIRI', 'F', 'WSTH', 'S-C', 'E-W', 'O-W'
+  'NX1', 'NX2', 'WX1', 'CTY', 'TMK', 'AIR', 'INN', 'OUT', 'STH', 'EAST', 'WEST', 'ONE', 'DEV', 'RANG', 'MTIA', 'HOBS', 'GULF', 'HMB', 'PINE', 'MTID', 'BAYS', 'BIRK', 'TIRI', 'F', 'WSTH', 'S-C', 'E-W', 'O-W', 'RBS', 'RBO', 'RBN', 'RBW', 'RBWX', 'RBSX', 'RBPX', 'RBE', 'S813'
 ]);
 
 function getTripStartTime(trip) {

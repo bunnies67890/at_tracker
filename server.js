@@ -212,6 +212,41 @@ function formatTripTime(timeStr) {
   return String(timeStr);
 }
 
+function formatCleanDestination(destination) {
+  if (!destination) return '';
+  let cleanDest = String(destination).trim();
+
+  // Remove leading "Route XYZ" or "Route XYZ:"
+  cleanDest = cleanDest.replace(/^route\s*\w+\s*:?\s*/i, '').trim();
+
+  // Strip the first "Origin to" segment if present (e.g., "Smales Farm to Constellation..." -> "Constellation...")
+  const parts = cleanDest.split(/\s+to\s+/i);
+  if (parts.length > 1) {
+    cleanDest = parts.slice(1).join(' to ').trim();
+  } else {
+    cleanDest = cleanDest.replace(/^to\s+/i, '').trim();
+  }
+
+  return cleanDest;
+}
+
+function formatTripTitle(routeDisplay, origin, destination) {
+  if (!routeDisplay || routeDisplay === 'NIS') return 'Not In Service';
+
+  const cleanDest = formatCleanDestination(destination);
+  if (cleanDest) {
+    return `${routeDisplay} to ${cleanDest}`;
+  }
+
+  // Fallback if destination was only "Route XYZ" or empty, avoiding "Scheduled Trip"
+  const fallbackDest = String(destination || '').replace(/^route\s*\w+\s*:?\s*/i, '').trim();
+  if (fallbackDest) {
+    return `${routeDisplay} to ${fallbackDest}`;
+  }
+
+  return routeDisplay;
+}
+
 function timeStrToSeconds(timeStr) {
   if (!timeStr) return 0;
   const parts = String(timeStr).split(':');
