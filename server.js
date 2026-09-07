@@ -32,6 +32,40 @@ function dbGet(sql, params = []) {
   });
 }
 
+// Search logic adjustment
+function handleSearch(query) {
+  const cleanQuery = query.trim().toUpperCase();
+
+  // 1. Check if it matches an existing route first (including school routes like S064)
+  const matchingRoute = routesCache.find(r => r.route_short_name.toUpperCase() === cleanQuery);
+  
+  if (matchingRoute) {
+    return displayRouteOnMap(matchingRoute.route_id);
+  }
+
+  // 2. Fall back to vehicle/fleet lookup if no exact route match is found
+  return displayVehicleOnMap(cleanQuery);
+}
+
+let currentRouteLine = null;
+
+function drawRouteLine(shapeCoordinates) {
+  // Remove existing line if present
+  if (currentRouteLine) {
+    map.removeLayer(currentRouteLine);
+  }
+
+  // Draw route polyline (Leaflet example)
+  currentRouteLine = L.polyline(shapeCoordinates, {
+    color: '#0055A5', // AT Blue
+    weight: 5,
+    opacity: 0.8,
+    lineJoin: 'round'
+  }).addTo(map);
+
+  map.fitBounds(currentRouteLine.getBounds(), { padding: [30, 30] });
+}
+
 function dbRun(sql, params = []) {
   return new Promise((resolve, reject) => {
     db.run(sql, params, function (err) { err ? reject(err) : resolve(this); });
