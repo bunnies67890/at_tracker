@@ -104,11 +104,11 @@ async function migrateToCompositeUniqueness() {
   }
 }
 
-async function initDatabase() {
-  await dbRun("PRAGMA journal_mode = WAL;");
-  await dbRun("PRAGMA synchronous = NORMAL;");
+db.serialize(() => {
+  db.run("PRAGMA journal_mode = WAL;");
+  db.run("PRAGMA synchronous = NORMAL;");
 
-  await dbRun(`
+  db.run(`
     CREATE TABLE IF NOT EXISTS shift_history (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       vehicle_id TEXT,
@@ -121,29 +121,31 @@ async function initDatabase() {
       tardiness TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
-  `);
+  `, async (err) => {
+    if (err) {
+      console.error('[DB] Initial table creation error:', err.message);
+      return;
+    }
+    db.run(`ALTER TABLE shift_history ADD COLUMN origin TEXT`, () => {});
+    
+    await migrateToCompositeUniqueness();
 
-  try {
-    await dbRun(`ALTER TABLE shift_history ADD COLUMN origin TEXT`);
-  } catch (e) {}
+    db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_shift_history_trip_day ON shift_history(trip_id, day)`, (idxErr) => {
+      if (idxErr) console.error('[DB] Could not create composite unique index:', idxErr.message);
+    });
 
-  await migrateToCompositeUniqueness();
-
-  await dbRun(`CREATE UNIQUE INDEX IF NOT EXISTS idx_shift_history_trip_day ON shift_history(trip_id, day)`);
-
-  await dbRun(`
-    DELETE FROM shift_history 
-    WHERE id IN (
-      SELECT h2.id 
-      FROM shift_history h1
-      JOIN shift_history h2 ON h1.trip_id = h2.trip_id 
-      WHERE h2.day > h1.day 
-        AND (h2.start_time LIKE '%PM%' OR CAST(SUBSTR(h2.start_time, 1, INSTR(h2.start_time, ':') - 1) AS INT) >= 6)
-    )
-  `);
-}
-
-initDatabase().catch(err => console.error('[DB Init Error]', err));
+    db.run(`
+      DELETE FROM shift_history 
+      WHERE id IN (
+        SELECT h2.id 
+        FROM shift_history h1
+        JOIN shift_history h2 ON h1.trip_id = h2.trip_id 
+        WHERE h2.day > h1.day 
+          AND (h2.start_time LIKE '%PM%' OR CAST(SUBSTR(h2.start_time, 1, INSTR(h2.start_time, ':') - 1) AS INT) >= 6)
+      )
+    `);
+  });
+});
 
 function purgeOldHistory() {
   const d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000); 
@@ -175,8 +177,6 @@ let routeDisplayToTripsMap = {};
 let allStops = [];
 let stopNamesMap = {};
 let stopDeparturesMap = {};
-
-let cachedLiveBuses = [];
 
 function cleanHeadsign(raw) {
   if (!raw) return '';
@@ -210,41 +210,6 @@ function formatTripTime(timeStr) {
     return `${hour}:${min} ${ampm}`;
   }
   return String(timeStr);
-}
-
-function formatCleanDestination(destination) {
-  if (!destination) return '';
-  let cleanDest = String(destination).trim();
-
-  // Remove leading "Route XYZ" or "Route XYZ:"
-  cleanDest = cleanDest.replace(/^route\s*\w+\s*:?\s*/i, '').trim();
-
-  // Strip the first "Origin to" segment if present (e.g., "Smales Farm to Constellation..." -> "Constellation...")
-  const parts = cleanDest.split(/\s+to\s+/i);
-  if (parts.length > 1) {
-    cleanDest = parts.slice(1).join(' to ').trim();
-  } else {
-    cleanDest = cleanDest.replace(/^to\s+/i, '').trim();
-  }
-
-  return cleanDest;
-}
-
-function formatTripTitle(routeDisplay, origin, destination) {
-  if (!routeDisplay || routeDisplay === 'NIS') return 'Not In Service';
-
-  const cleanDest = formatCleanDestination(destination);
-  if (cleanDest) {
-    return `${routeDisplay} to ${cleanDest}`;
-  }
-
-  // Fallback if destination was only "Route XYZ" or empty, avoiding "Scheduled Trip"
-  const fallbackDest = String(destination || '').replace(/^route\s*\w+\s*:?\s*/i, '').trim();
-  if (fallbackDest) {
-    return `${routeDisplay} to ${fallbackDest}`;
-  }
-
-  return routeDisplay;
 }
 
 function timeStrToSeconds(timeStr) {
@@ -563,7 +528,6 @@ async function loadOrFetchGtfsData() {
 loadOrFetchGtfsData();
 
 async function updateTripUpdates() {
-  if (!AT_API_KEY) return;
   try {
     const res = await fetch('https://api.at.govt.nz/realtime/legacy/tripupdates', {
       headers: { 'Ocp-Apim-Subscription-Key': AT_API_KEY }
@@ -576,7 +540,7 @@ async function updateTripUpdates() {
 
     entities.forEach((entity) => {
       const tu = entity.trip_update;
-      const tripId = tu?.trip?.trip_id || tu?.trip?.tripId;
+      const tripId = tu?.trip?.trip_id;
       if (!tripId) return;
 
       let tripDelay = tu.delay;
@@ -618,9 +582,8 @@ function formatTardiness(delaySeconds) {
 }
 
 function getActualTripStartTime(v, timestampSec) {
-  const rawStartTime = v?.trip?.start_time || v?.trip?.startTime;
-  if (rawStartTime) return formatTripTime(rawStartTime);
-  const tripId = String(v?.trip?.trip_id || v?.trip?.tripId || '');
+  if (v?.trip?.start_time) return formatTripTime(v.trip.start_time);
+  const tripId = String(v?.trip?.trip_id || '');
   if (tripStartTimeMap[tripId]) return tripStartTimeMap[tripId];
   const baseId = extractBaseTripId(tripId);
   if (tripStartTimeMap[baseId]) return tripStartTimeMap[baseId];
@@ -634,16 +597,22 @@ function getActualTripStartTime(v, timestampSec) {
   return new Date().toLocaleTimeString('en-NZ', { timeZone: 'Pacific/Auckland', hour: '2-digit', minute: '2-digit' });
 }
 
-async function fetchLiveBuses() {
-  if (!AT_API_KEY) return;
+// Memory Cache for Live Buses Endpoint
+let cachedLiveBuses = null;
+let lastFetchTime = 0;
+const CACHE_TTL_MS = 15000; // 15-second cache TTL
+
+app.get('/api/buses/live', async (req, res) => {
+  const now = Date.now();
+  if (cachedLiveBuses && (now - lastFetchTime < CACHE_TTL_MS)) {
+    return res.json(cachedLiveBuses);
+  }
+
   try {
     const url = `https://api.at.govt.nz/realtime/legacy/vehiclelocations?subscription-key=${AT_API_KEY}`;
     const response = await fetch(url, { headers: { 'Ocp-Apim-Subscription-Key': AT_API_KEY, 'Accept': 'application/json' } });
 
-    if (!response.ok) {
-      console.error(`[Background Bus Fetch Error] HTTP ${response.status}`);
-      return;
-    }
+    if (!response.ok) return res.status(response.status).json({ error: `AT API HTTP ${response.status}` });
 
     const data = await response.json();
     const entities = data.response?.entity || data.entity || [];
@@ -658,13 +627,13 @@ async function fetchLiveBuses() {
       const routeDisplay = routeIdToShortNameMap[routeRaw] || routeIdToShortNameMap[String(routeRaw).split('-')[0]] || parseRouteDisplay(routeRaw);
 
       const startTimeFormatted = getActualTripStartTime(v, v.timestamp || e.timestamp);
-      const tripId = v.trip?.trip_id || v.trip?.tripId || `trip_${vehicleId}_${routeDisplay}_${startTimeFormatted}`;
+      const tripId = v.trip?.trip_id || `trip_${vehicleId}_${routeDisplay}`;
       const baseTripId = extractBaseTripId(tripId);
 
       let finalOrigin = tripOriginMap[tripId] || tripOriginMap[baseTripId] || '';
       let finalDest = tripDestinationMap[tripId] || tripDestinationMap[baseTripId] || cleanHeadsign(v.trip?.trip_headsign) || (routeDisplay === 'NIS' ? 'Not In Service' : `Route ${routeDisplay}`);
 
-      const delaySec = v.trip?.delay ?? v.delay ?? delaysByTrip[tripId] ?? delaysByTrip[baseTripId];
+      const delaySec = v.trip?.delay ?? v.delay ?? delaysByTrip[tripId];
       const finalStatus = formatTardiness(delaySec);
 
       return {
@@ -682,8 +651,6 @@ async function fetchLiveBuses() {
       };
     }).filter(Boolean);
 
-    cachedLiveBuses = liveBuses;
-
     db.serialize(() => {
       db.run("BEGIN TRANSACTION;");
       const stmt = db.prepare(`
@@ -699,7 +666,7 @@ async function fetchLiveBuses() {
       `);
 
       liveBuses.forEach((b) => {
-        if (b.route_display !== 'NIS' && b.trip_id) {
+        if (b.route_display !== 'NIS') {
           const targetDay = getTripServiceDate(b.raw_vehicle_obj, todayStr);
 
           stmt.run([b.vehicle_id, b.trip_id, b.route_display, b.origin, b.destination, targetDay, b.start_time, b.tardiness], (err) => {
@@ -714,16 +681,13 @@ async function fetchLiveBuses() {
       });
     });
 
+    cachedLiveBuses = liveBuses;
+    lastFetchTime = now;
+
+    res.json(liveBuses);
   } catch (err) {
-    console.error('[Background Bus Fetch Exception]', err.message);
+    res.status(500).json({ error: 'Server Catch Error', details: err.message });
   }
-}
-
-fetchLiveBuses();
-setInterval(fetchLiveBuses, 20000);
-
-app.get('/api/buses/live', (req, res) => {
-  res.json(cachedLiveBuses);
 });
 
 app.get('/api/stops', (req, res) => {
